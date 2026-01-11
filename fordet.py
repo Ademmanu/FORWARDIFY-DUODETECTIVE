@@ -1995,10 +1995,10 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     status_emoji = "🟢" if is_logged_in else "🔴"
     status_text = "Online" if is_logged_in else "Offline"
     
-    message_text = f"""╔═══════════════════════════════════════╗
+    message_text = f"""╔════════════════════════════════════╗
 ║   📨🔍 FORWARDER + DUODETECTIVE BOT   ║
 ║   Telegram Message Management System   ║
-╚═══════════════════════════════════════╝
+╚════════════════════════════════════╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
