@@ -19,7 +19,7 @@ import threading
 import functools
 import re
 import signal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Set, Callable, Any, DefaultDict
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
@@ -63,43 +63,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("forwarder_duodetect")
-
-# ============================
-# DATETIME UTILITY FUNCTIONS
-# ============================
-def format_datetime_utc1(dt: datetime = None) -> str:
-    """
-    Format datetime to 'Jan 5, 2025 10:15 AM' using UTC+1.
-    Cross-platform compatible.
-    
-    Args:
-        dt: datetime object (defaults to current time)
-    
-    Returns:
-        Formatted string in UTC+1
-    """
-    if dt is None:
-        dt = datetime.utcnow()
-    
-    # Convert to UTC+1 (Europe/London for GMT/BST)
-    try:
-        # Try using pytz for timezone conversion
-        import pytz
-        utc1_tz = pytz.timezone('Europe/London')  # Uses GMT/BST (UTC/UTC+1)
-        dt_utc1 = dt.replace(tzinfo=timezone.utc).astimezone(utc1_tz)
-    except:
-        # Fallback: manually add 1 hour
-        dt_utc1 = dt + timedelta(hours=1)
-    
-    # Format the datetime
-    # Month abbreviation, day, year, hour:minute AM/PM
-    formatted = dt_utc1.strftime('%b %d, %Y %I:%M %p')
-    
-    # Remove leading zeros from day
-    if formatted[4] == '0':
-        formatted = formatted[:3] + formatted[5:]
-    
-    return formatted
 
 # ============================
 # ENVIRONMENT VARIABLES
@@ -333,8 +296,8 @@ class Database:
                             'name': row["name"],
                             'session_data': row["session_data"],
                             'is_logged_in': row["is_logged_in"],
-                            'created_at': format_datetime_utc1(row["created_at"]) if row["created_at"] else None,
-                            'updated_at': format_datetime_utc1(row["updated_at"]) if row["updated_at"] else None
+                            'created_at': row["created_at"].isoformat() if row["created_at"] else None,
+                            'updated_at': row["updated_at"].isoformat() if row["updated_at"] else None
                         }
                         self._user_cache[uid] = entry
 
@@ -571,8 +534,8 @@ class Database:
                             'name': row["name"],
                             'session_data': row["session_data"],
                             'is_logged_in': row["is_logged_in"],
-                            'created_at': format_datetime_utc1(row["created_at"]) if row["created_at"] else None,
-                            'updated_at': format_datetime_utc1(row["updated_at"]) if row["updated_at"] else None
+                            'created_at': row["created_at"].isoformat() if row["created_at"] else None,
+                            'updated_at': row["updated_at"].isoformat() if row["updated_at"] else None
                         }
                         self._user_cache[user_id] = user_data
                         return user_data.copy()
@@ -671,7 +634,7 @@ class Database:
                 if session_data is not None:
                     user_data['session_data'] = session_data
                 user_data['is_logged_in'] = is_logged_in
-                user_data['updated_at'] = format_datetime_utc1(datetime.now())
+                user_data['updated_at'] = datetime.now().isoformat()
             else:
                 if is_logged_in:
                     self._user_cache[user_id] = {
@@ -680,58 +643,12 @@ class Database:
                         'name': name,
                         'session_data': session_data,
                         'is_logged_in': is_logged_in,
-                        'updated_at': format_datetime_utc1(datetime.now())
+                        'updated_at': datetime.now().isoformat()
                     }
 
         except Exception as e:
             logger.exception("Error in save_user for %s: %s", user_id, e)
             raise
-    
-    def clear_user_data(self, user_id: int) -> bool:
-        """Completely clear all data for a user including tasks"""
-        try:
-            conn = self.get_connection()
-            
-            if self.db_type == "sqlite":
-                cur = conn.cursor()
-                # Delete forwarding tasks
-                cur.execute("DELETE FROM forwarding_tasks WHERE user_id = ?", (user_id,))
-                # Delete monitoring tasks
-                cur.execute("DELETE FROM monitoring_tasks WHERE user_id = ?", (user_id,))
-                # Clear user session data
-                cur.execute("""
-                    UPDATE users 
-                    SET session_data = NULL, is_logged_in = 0, phone = NULL, name = NULL, updated_at = datetime('now')
-                    WHERE user_id = ?
-                """, (user_id,))
-                conn.commit()
-            else:
-                with conn.cursor() as cur:
-                    # Delete forwarding tasks
-                    cur.execute("DELETE FROM forwarding_tasks WHERE user_id = %s", (user_id,))
-                    # Delete monitoring tasks
-                    cur.execute("DELETE FROM monitoring_tasks WHERE user_id = %s", (user_id,))
-                    # Clear user session data
-                    cur.execute("""
-                        UPDATE users 
-                        SET session_data = NULL, is_logged_in = FALSE, phone = NULL, name = NULL, updated_at = CURRENT_TIMESTAMP
-                        WHERE user_id = %s
-                    """, (user_id,))
-                    conn.commit()
-            
-            # Clear all caches
-            self._user_cache.pop(user_id, None)
-            self._forwarding_tasks_cache.pop(user_id, None)
-            self._monitoring_tasks_cache.pop(user_id, None)
-            self._allowed_users_cache.discard(user_id)
-            self._admin_cache.discard(user_id)
-            
-            logger.info(f"Cleared all data for user {user_id} from database")
-            return True
-            
-        except Exception as e:
-            logger.exception(f"Error clearing user data for {user_id}: {e}")
-            return False
     
     # ============================
     # FORWARDING TASKS METHODS
@@ -942,7 +859,7 @@ class Database:
                                 "target_ids": row["target_ids"] if row["target_ids"] else [],
                                 "filters": row["filters"] if row["filters"] else {},
                                 "is_active": row["is_active"],
-                                "created_at": format_datetime_utc1(row["created_at"]) if row["created_at"] else None,
+                                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                             }
                         )
             
@@ -1438,7 +1355,7 @@ class Database:
                             'username': row["username"],
                             'is_admin': row["is_admin"],
                             'added_by': row["added_by"],
-                            'created_at': format_datetime_utc1(row["created_at"]) if row["created_at"] else None
+                            'created_at': row["created_at"].isoformat() if row["created_at"] else None
                         })
             
             return users
@@ -4192,10 +4109,6 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         )
         return True
 
-    # Get user data before clearing anything
-    user = await db_call(db.get_user, user_id)
-    
-    # Disconnect and remove client
     if user_id in user_clients:
         client = user_clients[user_id]
         try:
@@ -4219,27 +4132,16 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
                 monitor_handler_registered.pop(user_id, None)
 
             await client.disconnect()
-            logger.info(f"Disconnected Telegram client for user {user_id}")
-        except Exception as e:
-            logger.exception(f"Error disconnecting client for user {user_id}: {e}")
+        except Exception:
+            pass
         finally:
             user_clients.pop(user_id, None)
 
     try:
-        # Use the new method to completely clear user data
-        success = await db_call(db.clear_user_data, user_id)
-        if not success:
-            # Fallback to old method
-            await db_call(db.save_user, user_id, None, None, None, False)
-    except Exception as e:
-        logger.exception(f"Error clearing user data from database for user {user_id}: {e}")
-        # Fallback: Try a simpler approach
-        try:
-            await db_call(db.save_user, user_id, None, None, None, False)
-        except Exception:
-            pass
+        await db_call(db.save_user, user_id, None, None, None, False)
+    except Exception:
+        pass
     
-    # Clear all in-memory caches
     phone_verification_states.pop(user_id, None)
     forwarding_tasks_cache.pop(user_id, None)
     monitoring_tasks_cache.pop(user_id, None)
@@ -4250,32 +4152,11 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     logout_states.pop(user_id, None)
     reply_states.pop(user_id, None)
     auto_reply_states.pop(user_id, None)
-    
-    # Clear authentication cache
-    _auth_cache.pop(user_id, None)
-    
-    # Clear message history for this user
-    keys_to_remove = []
-    for key in message_history.keys():
-        if key[0] == user_id:  # key is (user_id, chat_id)
-            keys_to_remove.append(key)
-    for key in keys_to_remove:
-        message_history.pop(key, None)
-    
-    # Clear notification messages for this user
-    notif_keys_to_remove = []
-    for key, value in notification_messages.items():
-        if value["user_id"] == user_id:
-            notif_keys_to_remove.append(key)
-    for key in notif_keys_to_remove:
-        notification_messages.pop(key, None)
-    
+
     await update.message.reply_text(
-        "👋 **Account disconnected successfully!**\n\n✅ All your sessions have been cleared.\n✅ All forwarding and monitoring tasks have been deleted.\n✅ You can now create new tasks with the same names.\n🔄 Use /login to connect again.",
+        "👋 **Account disconnected successfully!**\n\n✅ All your forwarding and monitoring tasks have been stopped.\n🔄 Use /login to connect again.",
         parse_mode="Markdown",
     )
-    
-    logger.info(f"User {user_id} logged out completely. All data cleared.")
     return True
 
 # ============================
@@ -4855,8 +4736,6 @@ async def notification_worker(worker_id: int):
             task_label = task.get("label", "Unknown")
             preview_text = message_text[:100] + "..." if len(message_text) > 100 else message_text
             
-            current_time = format_datetime_utc1(datetime.utcnow())
-            
             # Get bot instance if not available
             if bot_instance is None:
                 from telegram import Bot
@@ -4865,7 +4744,7 @@ async def notification_worker(worker_id: int):
             notification_msg = (
                 f"🚨 **DUPLICATE MESSAGE DETECTED!**\n\n"
                 f"**Task:** {task_label}\n"
-                f"**Time:** {current_time}\n\n"
+                f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 f"📝 **Message Preview:**\n`{preview_text}`\n\n"
                 f"💬 **Reply to this message to respond to the duplicate!**\n"
                 f"(Swipe left on this message and type your reply)"
