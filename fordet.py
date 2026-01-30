@@ -276,7 +276,7 @@ class Database:
             conn.execute("PRAGMA cache_size=-1000;")
             conn.execute("PRAGMA mmap_size=268435456;")
         except Exception:
-        pass
+            pass
     
     def _load_caches(self):
         try:
