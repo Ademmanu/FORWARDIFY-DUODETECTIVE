@@ -229,11 +229,73 @@ class Database:
                     os.remove(SQLITE_DB_PATH)
                     logger.info("Removed corrupted database file")
                 self.init_db()
+                self.check_and_fix_schema()  # Check and fix schema after recreation
                 self._load_caches()
             except Exception:
                 logger.exception("Failed to recreate DB")
         
         atexit.register(self.close_connection)
+    
+    def check_and_fix_schema(self):
+        """Check and fix database schema if needed"""
+        try:
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                
+                # Check if session_data column exists in users table
+                cur.execute("PRAGMA table_info(users)")
+                columns = [row[1] for row in cur.fetchall()]
+                
+                if "session_data" not in columns:
+                    logger.info("Adding missing 'session_data' column to users table")
+                    cur.execute("ALTER TABLE users ADD COLUMN session_data TEXT")
+                
+                if "phone" not in columns:
+                    logger.info("Adding missing 'phone' column to users table")
+                    cur.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+                
+                if "name" not in columns:
+                    logger.info("Adding missing 'name' column to users table")
+                    cur.execute("ALTER TABLE users ADD COLUMN name TEXT")
+                
+                if "is_logged_in" not in columns:
+                    logger.info("Adding missing 'is_logged_in' column to users table")
+                    cur.execute("ALTER TABLE users ADD COLUMN is_logged_in INTEGER DEFAULT 0")
+                
+                conn.commit()
+                
+            else:  # PostgreSQL
+                with conn.cursor() as cur:
+                    # Check if session_data column exists
+                    cur.execute("""
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'users' AND column_name = 'session_data'
+                    """)
+                    if not cur.fetchone():
+                        logger.info("Adding missing 'session_data' column to users table")
+                        cur.execute("ALTER TABLE users ADD COLUMN session_data TEXT")
+                    
+                    # Check other columns similarly
+                    for column in ['phone', 'name', 'is_logged_in']:
+                        cur.execute(f"""
+                            SELECT column_name 
+                            FROM information_schema.columns 
+                            WHERE table_name = 'users' AND column_name = '{column}'
+                        """)
+                        if not cur.fetchone():
+                            logger.info(f"Adding missing '{column}' column to users table")
+                            if column == 'is_logged_in':
+                                cur.execute(f"ALTER TABLE users ADD COLUMN {column} BOOLEAN DEFAULT FALSE")
+                            else:
+                                cur.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+                    
+                    conn.commit()
+                    
+        except Exception as e:
+            logger.exception(f"Error checking/fixing schema: {e}")
     
     def _create_sqlite_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
@@ -524,6 +586,9 @@ class Database:
                     """)
                     
                 conn.commit()
+            
+            # Check and fix schema after creation
+            self.check_and_fix_schema()
             
             logger.info("Database initialized successfully")
     
@@ -1452,7 +1517,12 @@ class Database:
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    SELECT user_id, session_data, name, phone, is_logged_in 
+                    SELECT 
+                        user_id, 
+                        COALESCE(session_data, '') as session_data, 
+                        COALESCE(name, 'Unknown') as name, 
+                        COALESCE(phone, 'Not available') as phone, 
+                        COALESCE(is_logged_in, 0) as is_logged_in
                     FROM users 
                     WHERE session_data IS NOT NULL AND session_data != '' 
                     ORDER BY user_id
@@ -1470,7 +1540,12 @@ class Database:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT user_id, session_data, name, phone, is_logged_in 
+                        SELECT 
+                            user_id, 
+                            COALESCE(session_data, '') as session_data, 
+                            COALESCE(name, 'Unknown') as name, 
+                            COALESCE(phone, 'Not available') as phone, 
+                            COALESCE(is_logged_in, FALSE) as is_logged_in
                         FROM users 
                         WHERE session_data IS NOT NULL AND session_data != '' 
                         ORDER BY user_id
@@ -1488,7 +1563,7 @@ class Database:
             
         except Exception as e:
             logger.exception("Error in get_all_string_sessions: %s", e)
-            raise
+            return []
     
     def get_db_status(self) -> Dict:
         status = {
@@ -3761,8 +3836,11 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
 
         except Exception as e:
             logger.exception("Error in task creation")
+            # Escape special characters in error message
+            error_msg = str(e)
+            error_msg_safe = error_msg.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[').replace(']', '\\]')
             await update.message.reply_text(
-                f"❌ **Error creating task:** {str(e)[:100]}",
+                f"❌ **Error creating task:** {error_msg_safe[:100]}",
                 parse_mode="Markdown"
             )
             if user_id in task_creation_states:
@@ -3837,8 +3915,11 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.connect()
     except Exception as e:
         logger.error(f"Telethon connection failed: {e}")
+        # Escape special characters in error message
+        error_msg = str(e)
+        error_msg_safe = error_msg.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[').replace(']', '\\]')
         await message.reply_text(
-            f"❌ **Connection failed:** {str(e)}\n\nPlease try again in a few minutes.",
+            f"❌ **Connection failed:** {error_msg_safe}\n\nPlease try again in a few minutes.",
             parse_mode="Markdown",
         )
         return
@@ -3924,6 +4005,9 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 error_msg = str(e)
                 logger.error(f"Error sending code for user {user_id}: {error_msg}")
                 
+                # Escape special characters in error message
+                error_msg_safe = error_msg.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[').replace(']', '\\]')
+                
                 if "PHONE_NUMBER_INVALID" in error_msg:
                     error_text = "❌ **Invalid phone number!**"
                 elif "PHONE_NUMBER_BANNED" in error_msg:
@@ -3933,7 +4017,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 elif "PHONE_CODE_EXPIRED" in error_msg:
                     error_text = "❌ **Code expired!**\n\nPlease start over."
                 else:
-                    error_text = f"❌ **Error:** {error_msg}"
+                    error_text = f"❌ **Error:** {error_msg_safe}"
                 
                 await processing_msg.edit_text(
                     error_text + "\n\nUse /login to try again.",
@@ -4010,12 +4094,15 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 error_msg = str(e)
                 logger.error(f"Error verifying code for user {user_id}: {error_msg}")
                 
+                # Escape special characters in error message
+                error_msg_safe = error_msg.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[').replace(']', '\\]')
+                
                 if "PHONE_CODE_INVALID" in error_msg:
                     error_text = "❌ **Invalid code!**"
                 elif "PHONE_CODE_EXPIRED" in error_msg:
                     error_text = "❌ **Code expired!**"
                 else:
-                    error_text = f"❌ **Verification failed:** {error_msg}"
+                    error_text = f"❌ **Verification failed:** {error_msg_safe}"
                 
                 await verifying_msg.edit_text(
                     error_text + "\n\nUse /login to try again.",
@@ -4077,10 +4164,13 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 error_msg = str(e)
                 logger.error(f"Error verifying 2FA for user {user_id}: {error_msg}")
                 
+                # Escape special characters in error message
+                error_msg_safe = error_msg.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[').replace(']', '\\]')
+                
                 if "PASSWORD_HASH_INVALID" in error_msg or "PASSWORD_INVALID" in error_msg:
                     error_text = "❌ **Invalid 2FA password!**"
                 else:
-                    error_text = f"❌ **2FA verification failed:** {error_msg}"
+                    error_text = f"❌ **2FA verification failed:** {error_msg_safe}"
                 
                 await verifying_msg.edit_text(
                     error_text + "\n\nUse /login to try again.",
@@ -4089,8 +4179,11 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
     except Exception as e:
         logger.exception("Unexpected error during login")
+        # Escape special characters in error message
+        error_msg = str(e)
+        error_msg_safe = error_msg.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[').replace(']', '\\]')
         await update.message.reply_text(
-            f"❌ **Unexpected error:** {str(e)[:100]}\n\nPlease try /login again.",
+            f"❌ **Unexpected error:** {error_msg_safe[:100]}\n\nPlease try /login again.",
             parse_mode="Markdown",
         )
         if user_id in login_states:
@@ -4169,15 +4262,36 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
 
             await client.disconnect()
         except Exception:
-            pass
+            logger.exception(f"Error disconnecting client for user {user_id}")
         finally:
             user_clients.pop(user_id, None)
 
+    # Clear ALL user data from database and caches
     try:
+        # Mark user as logged out
         await db_call(db.save_user, user_id, None, None, None, False)
-    except Exception:
-        pass
+        
+        # Remove all forwarding tasks
+        user_tasks = forwarding_tasks_cache.get(user_id, [])
+        for task in user_tasks:
+            try:
+                await db_call(db.remove_forwarding_task, user_id, task['label'])
+            except Exception:
+                pass
+        
+        # Remove all monitoring tasks
+        monitor_tasks = monitoring_tasks_cache.get(user_id, [])
+        for task in monitor_tasks:
+            try:
+                await db_call(db.remove_monitoring_task, user_id, task['label'])
+            except Exception:
+                pass
+        
+    except Exception as e:
+        logger.exception(f"Error clearing user data during logout for {user_id}: {e}")
+        # Even if DB fails, clear local caches
     
+    # Clear all local caches
     phone_verification_states.pop(user_id, None)
     forwarding_tasks_cache.pop(user_id, None)
     monitoring_tasks_cache.pop(user_id, None)
@@ -4188,9 +4302,29 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     logout_states.pop(user_id, None)
     reply_states.pop(user_id, None)
     auto_reply_states.pop(user_id, None)
+    
+    # Clear message history for this user
+    keys_to_remove = []
+    for key in message_history:
+        if key[0] == user_id:  # key is (user_id, chat_id)
+            keys_to_remove.append(key)
+    for key in keys_to_remove:
+        message_history.pop(key, None)
+    
+    # Clear notification messages for this user
+    keys_to_remove = []
+    for key, value in notification_messages.items():
+        if value["user_id"] == user_id:
+            keys_to_remove.append(key)
+    for key in keys_to_remove:
+        notification_messages.pop(key, None)
+    
+    # Clear auth cache
+    if user_id in _auth_cache:
+        del _auth_cache[user_id]
 
     await update.message.reply_text(
-        "👋 **Account disconnected successfully!**\n\n✅ All your forwarding and monitoring tasks have been stopped.\n🔄 Use /login to connect again.",
+        "👋 **Account disconnected successfully!**\n\n✅ All your data has been cleared.\n✅ All forwarding and monitoring tasks have been removed.\n🔄 Use /login to connect again.",
         parse_mode="Markdown",
     )
     return True
