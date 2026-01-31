@@ -14,6 +14,7 @@ import hashlib
 import time
 import gc
 import json
+import sqlite3
 import threading
 import functools
 import re
@@ -70,11 +71,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 
-# Database configuration - PostgreSQL only
+# Database configuration
+DATABASE_TYPE = os.getenv("DATABASE_TYPE", "sqlite").lower()
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    logger.error("DATABASE_URL environment variable is required for PostgreSQL")
-    sys.exit(1)
+SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "combined_bot_data.db")
+
+if DATABASE_TYPE == "postgres" and not DATABASE_URL:
+    logger.warning("DATABASE_TYPE is set to 'postgres' but DATABASE_URL is not set!")
+    logger.warning("Falling back to SQLite")
+    DATABASE_TYPE = "sqlite"
+
+logger.info(f"Using database type: {DATABASE_TYPE}")
 
 # User sessions from environment
 USER_SESSIONS = {}
@@ -155,11 +162,13 @@ Or
 """
 
 # ============================
-# DATABASE CLASS (PostgreSQL ONLY) - UPDATED WITH SCHEMA FIXES
+# DATABASE CLASS
 # ============================
 class Database:
     
     def __init__(self):
+        self.db_type = DATABASE_TYPE
+        self.db_path = SQLITE_DB_PATH
         self.postgres_url = DATABASE_URL
         
         self._conn_init_lock = threading.Lock()
@@ -176,14 +185,30 @@ class Database:
         try:
             self.init_db()
             self._load_caches()
-            logger.info("Database initialized with PostgreSQL")
+            logger.info(f"Database initialized with type: {self.db_type}")
         except Exception as e:
-            logger.exception(f"Failed initializing PostgreSQL DB: {e}")
-            raise
+            logger.exception(f"Failed initializing DB: {e}")
+            try:
+                if os.path.exists(SQLITE_DB_PATH):
+                    os.remove(SQLITE_DB_PATH)
+                    logger.info("Removed corrupted database file")
+                self.init_db()
+                self._load_caches()
+            except Exception:
+                logger.exception("Failed to recreate DB")
         
         atexit.register(self.close_connection)
     
+    def _create_sqlite_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        self._apply_sqlite_pragmas(conn)
+        return conn
+    
     def _create_postgres_connection(self) -> psycopg.Connection:
+        if not self.postgres_url:
+            raise ValueError("DATABASE_URL not set for PostgreSQL")
+        
         parsed = urlparse(self.postgres_url)
         
         dbname = parsed.path[1:]
@@ -206,11 +231,22 @@ class Database:
         )
         return conn
     
+    def _apply_sqlite_pragmas(self, conn: sqlite3.Connection):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA cache_size=-1000;")
+            conn.execute("PRAGMA mmap_size=268435456;")
+        except Exception:
+            pass
+    
     def _load_caches(self):
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 cur.execute("SELECT user_id, is_admin FROM allowed_users")
                 rows = cur.fetchall()
                 for row in rows:
@@ -221,7 +257,7 @@ class Database:
                 
                 cur.execute("""
                     SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at 
-                    FROM users WHERE is_logged_in = TRUE
+                    FROM users WHERE is_logged_in = 1
                 """)
                 rows = cur.fetchall()
                 for row in rows:
@@ -231,11 +267,39 @@ class Database:
                         'phone': row["phone"],
                         'name': row["name"],
                         'session_data': row["session_data"],
-                        'is_logged_in': row["is_logged_in"],
-                        'created_at': row["created_at"].isoformat() if row["created_at"] else None,
-                        'updated_at': row["updated_at"].isoformat() if row["updated_at"] else None
+                        'is_logged_in': bool(row["is_logged_in"]),
+                        'created_at': row["created_at"],
+                        'updated_at': row["updated_at"]
                     }
                     self._user_cache[uid] = entry
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id, is_admin FROM allowed_users")
+                    rows = cur.fetchall()
+                    for row in rows:
+                        user_id = row["user_id"]
+                        self._allowed_users_cache.add(user_id)
+                        if row["is_admin"]:
+                            self._admin_cache.add(user_id)
+                    
+                    cur.execute("""
+                        SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at 
+                        FROM users WHERE is_logged_in = TRUE
+                    """)
+                    rows = cur.fetchall()
+                    for row in rows:
+                        uid = row["user_id"]
+                        entry = {
+                            'user_id': uid,
+                            'phone': row["phone"],
+                            'name': row["name"],
+                            'session_data': row["session_data"],
+                            'is_logged_in': row["is_logged_in"],
+                            'created_at': row["created_at"].isoformat() if row["created_at"] else None,
+                            'updated_at': row["updated_at"].isoformat() if row["updated_at"] else None
+                        }
+                        self._user_cache[uid] = entry
 
             logger.info(f"Loaded caches: {len(self._allowed_users_cache)} allowed users, {len(self._user_cache)} logged-in users")
         except Exception as e:
@@ -246,8 +310,11 @@ class Database:
         
         if conn:
             try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
+                if self.db_type == "sqlite":
+                    conn.execute("SELECT 1")
+                else:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
                 return conn
             except Exception:
                 try:
@@ -257,10 +324,13 @@ class Database:
                 self._thread_local.conn = None
         
         try:
-            self._thread_local.conn = self._create_postgres_connection()
+            if self.db_type == "sqlite":
+                self._thread_local.conn = self._create_sqlite_connection()
+            else:
+                self._thread_local.conn = self._create_postgres_connection()
             return self._thread_local.conn
         except Exception as e:
-            logger.exception("Failed to create PostgreSQL connection: %s", e)
+            logger.exception("Failed to create DB connection: %s", e)
             raise
     
     def close_connection(self):
@@ -273,225 +343,153 @@ class Database:
             self._thread_local.conn = None
     
     def init_db(self):
-        """Initialize database with schema verification and missing column fixes"""
         with self._conn_init_lock:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
-                # Create users table with all columns
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                
+                # Users table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
-                        user_id BIGINT PRIMARY KEY,
-                        phone VARCHAR(255),
+                        user_id INTEGER PRIMARY KEY,
+                        phone TEXT,
                         name TEXT,
                         session_data TEXT,
-                        is_logged_in BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        is_logged_in INTEGER DEFAULT 0,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now'))
                     )
                 """)
                 
-                # Create forwarding_tasks table with all columns
+                # Forwarding tasks table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS forwarding_tasks (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT,
-                        label VARCHAR(255),
-                        source_ids JSONB DEFAULT '[]'::jsonb,
-                        target_ids JSONB DEFAULT '[]'::jsonb,
-                        filters JSONB DEFAULT '{}'::jsonb,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        label TEXT,
+                        source_ids TEXT,
+                        target_ids TEXT,
+                        filters TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now')),
+                        FOREIGN KEY (user_id) REFERENCES users (user_id),
                         UNIQUE(user_id, label)
                     )
                 """)
                 
-                # Create monitoring_tasks table with all columns
+                # Monitoring tasks table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS monitoring_tasks (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT,
-                        label VARCHAR(255),
-                        chat_ids JSONB DEFAULT '[]'::jsonb,
-                        settings JSONB DEFAULT '{}'::jsonb,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        label TEXT,
+                        chat_ids TEXT,
+                        settings TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now')),
+                        FOREIGN KEY (user_id) REFERENCES users (user_id),
                         UNIQUE(user_id, label)
                     )
                 """)
                 
-                # Create allowed_users table with all columns
+                # Allowed users table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS allowed_users (
-                        user_id BIGINT PRIMARY KEY,
-                        username VARCHAR(255),
-                        is_admin BOOLEAN DEFAULT FALSE,
-                        added_by BIGINT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        user_id INTEGER PRIMARY KEY,
+                        username TEXT,
+                        is_admin INTEGER DEFAULT 0,
+                        added_by INTEGER,
+                        created_at TEXT DEFAULT (datetime('now'))
                     )
-                """)
-                
-                # ============================================
-                # FIX MISSING COLUMNS FOR EXISTING TABLES
-                # ============================================
-                
-                # Fix users table - add missing columns if they don't exist
-                cur.execute("""
-                    DO $$
-                    BEGIN
-                        -- Users table fixes
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='is_logged_in') THEN
-                            ALTER TABLE users ADD COLUMN is_logged_in BOOLEAN DEFAULT FALSE;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='phone') THEN
-                            ALTER TABLE users ADD COLUMN phone VARCHAR(255);
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='name') THEN
-                            ALTER TABLE users ADD COLUMN name TEXT;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='session_data') THEN
-                            ALTER TABLE users ADD COLUMN session_data TEXT;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='created_at') THEN
-                            ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='updated_at') THEN
-                            ALTER TABLE users ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        END IF;
-                        
-                        -- Forwarding tasks table fixes
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='forwarding_tasks' AND column_name='filters') THEN
-                            ALTER TABLE forwarding_tasks ADD COLUMN filters JSONB DEFAULT '{}'::jsonb;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='forwarding_tasks' AND column_name='is_active') THEN
-                            ALTER TABLE forwarding_tasks ADD COLUMN is_active BOOLEAN DEFAULT TRUE;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='forwarding_tasks' AND column_name='created_at') THEN
-                            ALTER TABLE forwarding_tasks ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='forwarding_tasks' AND column_name='updated_at') THEN
-                            ALTER TABLE forwarding_tasks ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        END IF;
-                        
-                        -- Monitoring tasks table fixes
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='monitoring_tasks' AND column_name='settings') THEN
-                            ALTER TABLE monitoring_tasks ADD COLUMN settings JSONB DEFAULT '{}'::jsonb;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='monitoring_tasks' AND column_name='is_active') THEN
-                            ALTER TABLE monitoring_tasks ADD COLUMN is_active BOOLEAN DEFAULT TRUE;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='monitoring_tasks' AND column_name='created_at') THEN
-                            ALTER TABLE monitoring_tasks ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='monitoring_tasks' AND column_name='updated_at') THEN
-                            ALTER TABLE monitoring_tasks ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        END IF;
-                        
-                        -- Allowed users table fixes
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='allowed_users' AND column_name='username') THEN
-                            ALTER TABLE allowed_users ADD COLUMN username VARCHAR(255);
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='allowed_users' AND column_name='is_admin') THEN
-                            ALTER TABLE allowed_users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='allowed_users' AND column_name='added_by') THEN
-                            ALTER TABLE allowed_users ADD COLUMN added_by BIGINT;
-                        END IF;
-                        
-                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='allowed_users' AND column_name='created_at') THEN
-                            ALTER TABLE allowed_users ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        END IF;
-                    END
-                    $$;
-                """)
-                
-                # Set default values for JSONB columns
-                cur.execute("""
-                    DO $$
-                    BEGIN
-                        -- Ensure JSONB columns have proper defaults
-                        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='forwarding_tasks' AND column_name='source_ids') THEN
-                            ALTER TABLE forwarding_tasks ALTER COLUMN source_ids SET DEFAULT '[]'::jsonb;
-                        END IF;
-                        
-                        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='forwarding_tasks' AND column_name='target_ids') THEN
-                            ALTER TABLE forwarding_tasks ALTER COLUMN target_ids SET DEFAULT '[]'::jsonb;
-                        END IF;
-                        
-                        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='forwarding_tasks' AND column_name='filters') THEN
-                            ALTER TABLE forwarding_tasks ALTER COLUMN filters SET DEFAULT '{}'::jsonb;
-                        END IF;
-                        
-                        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='monitoring_tasks' AND column_name='chat_ids') THEN
-                            ALTER TABLE monitoring_tasks ALTER COLUMN chat_ids SET DEFAULT '[]'::jsonb;
-                        END IF;
-                        
-                        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='monitoring_tasks' AND column_name='settings') THEN
-                            ALTER TABLE monitoring_tasks ALTER COLUMN settings SET DEFAULT '{}'::jsonb;
-                        END IF;
-                    END
-                    $$;
-                """)
-                
-                # Create foreign key constraints if they don't exist
-                cur.execute("""
-                    DO $$
-                    BEGIN
-                        -- Forwarding tasks foreign key
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.table_constraints 
-                            WHERE table_name='forwarding_tasks' AND constraint_name='forwarding_tasks_user_id_fkey'
-                        ) AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='users') THEN
-                            ALTER TABLE forwarding_tasks 
-                            ADD CONSTRAINT forwarding_tasks_user_id_fkey 
-                            FOREIGN KEY (user_id) REFERENCES users (user_id);
-                        END IF;
-                        
-                        -- Monitoring tasks foreign key
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.table_constraints 
-                            WHERE table_name='monitoring_tasks' AND constraint_name='monitoring_tasks_user_id_fkey'
-                        ) AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='users') THEN
-                            ALTER TABLE monitoring_tasks 
-                            ADD CONSTRAINT monitoring_tasks_user_id_fkey 
-                            FOREIGN KEY (user_id) REFERENCES users (user_id);
-                        END IF;
-                    END
-                    $$;
                 """)
                 
                 # Create indexes
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)
-                """)
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_forwarding_tasks_user_active ON forwarding_tasks(user_id, is_active)
-                """)
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_monitoring_tasks_user_active ON monitoring_tasks(user_id, is_active)
-                """)
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)
-                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_forwarding_tasks_user_active ON forwarding_tasks(user_id, is_active)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_monitoring_tasks_user_active ON monitoring_tasks(user_id, is_active)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)")
                 
-            conn.commit()
+                conn.commit()
+                
+            else:
+                with conn.cursor() as cur:
+                    # Users table
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS users (
+                            user_id BIGINT PRIMARY KEY,
+                            phone VARCHAR(255),
+                            name TEXT,
+                            session_data TEXT,
+                            is_logged_in BOOLEAN DEFAULT FALSE,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    # Forwarding tasks table
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS forwarding_tasks (
+                            id SERIAL PRIMARY KEY,
+                            user_id BIGINT,
+                            label VARCHAR(255),
+                            source_ids JSONB,
+                            target_ids JSONB,
+                            filters JSONB,
+                            is_active BOOLEAN DEFAULT TRUE,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (user_id) REFERENCES users (user_id),
+                            UNIQUE(user_id, label)
+                        )
+                    """)
+                    
+                    # Monitoring tasks table
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS monitoring_tasks (
+                            id SERIAL PRIMARY KEY,
+                            user_id BIGINT,
+                            label VARCHAR(255),
+                            chat_ids JSONB,
+                            settings JSONB,
+                            is_active BOOLEAN DEFAULT TRUE,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (user_id) REFERENCES users (user_id),
+                            UNIQUE(user_id, label)
+                        )
+                    """)
+                    
+                    # Allowed users table
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS allowed_users (
+                            user_id BIGINT PRIMARY KEY,
+                            username VARCHAR(255),
+                            is_admin BOOLEAN DEFAULT FALSE,
+                            added_by BIGINT,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    # Create indexes
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_forwarding_tasks_user_active ON forwarding_tasks(user_id, is_active)
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_monitoring_tasks_user_active ON monitoring_tasks(user_id, is_active)
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)
+                    """)
+                    
+                conn.commit()
             
-            logger.info("PostgreSQL database initialized successfully with schema verification")
+            logger.info("Database initialized successfully")
     
     def get_user(self, user_id: int) -> Optional[Dict]:
         if user_id in self._user_cache:
@@ -500,10 +498,11 @@ class Database:
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 cur.execute("""
                     SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at 
-                    FROM users WHERE user_id = %s
+                    FROM users WHERE user_id = ?
                 """, (user_id,))
                 row = cur.fetchone()
 
@@ -513,12 +512,33 @@ class Database:
                         'phone': row["phone"],
                         'name': row["name"],
                         'session_data': row["session_data"],
-                        'is_logged_in': row["is_logged_in"],
-                        'created_at': row["created_at"].isoformat() if row["created_at"] else None,
-                        'updated_at': row["updated_at"].isoformat() if row["updated_at"] else None
+                        'is_logged_in': bool(row["is_logged_in"]),
+                        'created_at': row["created_at"],
+                        'updated_at': row["updated_at"]
                     }
                     self._user_cache[user_id] = user_data
                     return user_data.copy()
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at 
+                        FROM users WHERE user_id = %s
+                    """, (user_id,))
+                    row = cur.fetchone()
+
+                    if row:
+                        user_data = {
+                            'user_id': row["user_id"],
+                            'phone': row["phone"],
+                            'name': row["name"],
+                            'session_data': row["session_data"],
+                            'is_logged_in': row["is_logged_in"],
+                            'created_at': row["created_at"].isoformat() if row["created_at"] else None,
+                            'updated_at': row["updated_at"].isoformat() if row["updated_at"] else None
+                        }
+                        self._user_cache[user_id] = user_data
+                        return user_data.copy()
                         
             return None
         except Exception as e:
@@ -530,8 +550,9 @@ class Database:
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
                 exists = cur.fetchone() is not None
 
                 if exists:
@@ -539,35 +560,69 @@ class Database:
                     params = []
 
                     if phone is not None:
-                        updates.append("phone = %s")
+                        updates.append("phone = ?")
                         params.append(phone)
                     if name is not None:
-                        updates.append("name = %s")
+                        updates.append("name = ?")
                         params.append(name)
                     if session_data is not None:
-                        updates.append("session_data = %s")
+                        updates.append("session_data = ?")
                         params.append(session_data)
 
-                    updates.append("is_logged_in = %s")
-                    params.append(is_logged_in)
-                    updates.append("updated_at = CURRENT_TIMESTAMP")
+                    updates.append("is_logged_in = ?")
+                    params.append(1 if is_logged_in else 0)
+                    updates.append("updated_at = datetime('now')")
                     params.append(user_id)
                     
-                    query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = %s"
+                    query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
                     cur.execute(query, params)
                 else:
                     cur.execute("""
                         INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (user_id) DO UPDATE SET
-                            phone = EXCLUDED.phone,
-                            name = EXCLUDED.name,
-                            session_data = EXCLUDED.session_data,
-                            is_logged_in = EXCLUDED.is_logged_in,
-                            updated_at = CURRENT_TIMESTAMP
-                    """, (user_id, phone, name, session_data, is_logged_in))
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (user_id, phone, name, session_data, 1 if is_logged_in else 0))
                 
-            conn.commit()
+                conn.commit()
+                
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
+                    exists = cur.fetchone() is not None
+
+                    if exists:
+                        updates = []
+                        params = []
+
+                        if phone is not None:
+                            updates.append("phone = %s")
+                            params.append(phone)
+                        if name is not None:
+                            updates.append("name = %s")
+                            params.append(name)
+                        if session_data is not None:
+                            updates.append("session_data = %s")
+                            params.append(session_data)
+
+                        updates.append("is_logged_in = %s")
+                        params.append(is_logged_in)
+                        updates.append("updated_at = CURRENT_TIMESTAMP")
+                        params.append(user_id)
+                        
+                        query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = %s"
+                        cur.execute(query, params)
+                    else:
+                        cur.execute("""
+                            INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (user_id) DO UPDATE SET
+                                phone = EXCLUDED.phone,
+                                name = EXCLUDED.name,
+                                session_data = EXCLUDED.session_data,
+                                is_logged_in = EXCLUDED.is_logged_in,
+                                updated_at = CURRENT_TIMESTAMP
+                        """, (user_id, phone, name, session_data, is_logged_in))
+                
+                conn.commit()
 
             # Update cache
             if user_id in self._user_cache:
@@ -619,35 +674,63 @@ class Database:
                     "control": True
                 }
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 try:
                     cur.execute(
                         """
                         INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (user_id, label) DO NOTHING
-                        RETURNING id
+                        VALUES (?, ?, ?, ?, ?)
                     """,
                         (user_id, label, json.dumps(source_ids), json.dumps(target_ids), json.dumps(filters)),
                     )
-                    row = cur.fetchone()
+                    task_id = cur.lastrowid
                     conn.commit()
                     
-                    if row:
-                        task_id = row["id"]
-                        task = {
-                            "id": task_id,
-                            "label": label,
-                            "source_ids": source_ids,
-                            "target_ids": target_ids,
-                            "filters": filters,
-                            "is_active": 1
-                        }
-                        self._forwarding_tasks_cache[user_id].append(task)
-                        return True
+                    task = {
+                        "id": task_id,
+                        "label": label,
+                        "source_ids": source_ids,
+                        "target_ids": target_ids,
+                        "filters": filters,
+                        "is_active": 1
+                    }
+                    self._forwarding_tasks_cache[user_id].append(task)
+                    
+                    return True
+                except sqlite3.IntegrityError:
                     return False
-                except psycopg.errors.UniqueViolation:
-                    return False
+                    
+            else:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, filters)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (user_id, label) DO NOTHING
+                            RETURNING id
+                        """,
+                            (user_id, label, json.dumps(source_ids), json.dumps(target_ids), json.dumps(filters)),
+                        )
+                        row = cur.fetchone()
+                        conn.commit()
+                        
+                        if row:
+                            task_id = row["id"]
+                            task = {
+                                "id": task_id,
+                                "label": label,
+                                "source_ids": source_ids,
+                                "target_ids": target_ids,
+                                "filters": filters,
+                                "is_active": 1
+                            }
+                            self._forwarding_tasks_cache[user_id].append(task)
+                            return True
+                        return False
+                    except psycopg.errors.UniqueViolation:
+                        return False
                         
         except Exception as e:
             logger.exception("Error in add_forwarding_task for %s: %s", user_id, e)
@@ -657,17 +740,31 @@ class Database:
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 cur.execute(
                     """
                     UPDATE forwarding_tasks 
-                    SET filters = %s, updated_at = CURRENT_TIMESTAMP
-                    WHERE user_id = %s AND label = %s
+                    SET filters = ?, updated_at = datetime('now')
+                    WHERE user_id = ? AND label = ?
                     """,
                     (json.dumps(filters), user_id, label),
                 )
                 updated = cur.rowcount > 0
                 conn.commit()
+                
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE forwarding_tasks 
+                        SET filters = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = %s AND label = %s
+                        """,
+                        (json.dumps(filters), user_id, label),
+                    )
+                    updated = cur.rowcount > 0
+                    conn.commit()
 
             if updated and user_id in self._forwarding_tasks_cache:
                 for task in self._forwarding_tasks_cache[user_id]:
@@ -684,10 +781,16 @@ class Database:
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM forwarding_tasks WHERE user_id = %s AND label = %s", (user_id, label))
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("DELETE FROM forwarding_tasks WHERE user_id = ? AND label = ?", (user_id, label))
                 deleted = cur.rowcount > 0
                 conn.commit()
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM forwarding_tasks WHERE user_id = %s AND label = %s", (user_id, label))
+                    deleted = cur.rowcount > 0
+                    conn.commit()
 
             if deleted and user_id in self._forwarding_tasks_cache:
                 self._forwarding_tasks_cache[user_id] = [t for t in self._forwarding_tasks_cache[user_id] if t.get('label') != label]
@@ -705,29 +808,60 @@ class Database:
             conn = self.get_connection()
             tasks = []
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 cur.execute(
                     """
                     SELECT id, label, source_ids, target_ids, filters, is_active, created_at
                     FROM forwarding_tasks
-                    WHERE user_id = %s AND is_active = TRUE
+                    WHERE user_id = ? AND is_active = 1
                     ORDER BY created_at DESC
                 """,
                     (user_id,),
                 )
 
                 for row in cur.fetchall():
+                    try:
+                        filters_data = json.loads(row["filters"]) if row["filters"] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        filters_data = {}
+
                     tasks.append(
                         {
                             "id": row["id"],
                             "label": row["label"],
-                            "source_ids": row["source_ids"] if row["source_ids"] else [],
-                            "target_ids": row["target_ids"] if row["target_ids"] else [],
-                            "filters": row["filters"] if row["filters"] else {},
+                            "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
+                            "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                            "filters": filters_data,
                             "is_active": row["is_active"],
-                            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                            "created_at": row["created_at"],
                         }
                     )
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, label, source_ids, target_ids, filters, is_active, created_at
+                        FROM forwarding_tasks
+                        WHERE user_id = %s AND is_active = TRUE
+                        ORDER BY created_at DESC
+                    """,
+                        (user_id,),
+                    )
+
+                    for row in cur.fetchall():
+                        tasks.append(
+                            {
+                                "id": row["id"],
+                                "label": row["label"],
+                                "source_ids": row["source_ids"] if row["source_ids"] else [],
+                                "target_ids": row["target_ids"] if row["target_ids"] else [],
+                                "filters": row["filters"] if row["filters"] else {},
+                                "is_active": row["is_active"],
+                                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                            }
+                        )
             
             if tasks:
                 self._forwarding_tasks_cache[user_id] = tasks
@@ -742,22 +876,28 @@ class Database:
             conn = self.get_connection()
             tasks = []
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 cur.execute(
                     """
                     SELECT user_id, id, label, source_ids, target_ids, filters
                     FROM forwarding_tasks
-                    WHERE is_active = TRUE
+                    WHERE is_active = 1
                 """
                 )
                 for row in cur.fetchall():
+                    try:
+                        filters_data = json.loads(row["filters"]) if row["filters"] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        filters_data = {}
+
                     task = {
                         "user_id": row["user_id"],
                         "id": row["id"],
                         "label": row["label"],
-                        "source_ids": row["source_ids"] if row["source_ids"] else [],
-                        "target_ids": row["target_ids"] if row["target_ids"] else [],
-                        "filters": row["filters"] if row["filters"] else {},
+                        "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
+                        "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                        "filters": filters_data,
                     }
                     tasks.append(task)
 
@@ -771,6 +911,37 @@ class Database:
                             "filters": task["filters"],
                             "is_active": 1
                         })
+                        
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT user_id, id, label, source_ids, target_ids, filters
+                        FROM forwarding_tasks
+                        WHERE is_active = TRUE
+                    """
+                    )
+                    for row in cur.fetchall():
+                        task = {
+                            "user_id": row["user_id"],
+                            "id": row["id"],
+                            "label": row["label"],
+                            "source_ids": row["source_ids"] if row["source_ids"] else [],
+                            "target_ids": row["target_ids"] if row["target_ids"] else [],
+                            "filters": row["filters"] if row["filters"] else {},
+                        }
+                        tasks.append(task)
+
+                        uid = task["user_id"]
+                        if uid not in self._forwarding_tasks_cache or not any(t['id'] == task['id'] for t in self._forwarding_tasks_cache.get(uid, [])):
+                            self._forwarding_tasks_cache[uid].append({
+                                "id": task["id"],
+                                "label": task["label"],
+                                "source_ids": task["source_ids"],
+                                "target_ids": task["target_ids"],
+                                "filters": task["filters"],
+                                "is_active": 1
+                            })
             return tasks
         except Exception as e:
             logger.exception("Error in get_all_active_forwarding_tasks: %s", e)
@@ -793,32 +964,57 @@ class Database:
                     "outgoing_message_monitoring": True
                 }
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 try:
                     cur.execute("""
                         INSERT INTO monitoring_tasks (user_id, label, chat_ids, settings)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (user_id, label) DO NOTHING
-                        RETURNING id
+                        VALUES (?, ?, ?, ?)
                     """, (user_id, label, json.dumps(chat_ids), json.dumps(settings)))
                     
-                    row = cur.fetchone()
+                    task_id = cur.lastrowid
                     conn.commit()
                     
-                    if row:
-                        task_id = row["id"]
-                        task = {
-                            'id': task_id,
-                            'label': label,
-                            'chat_ids': chat_ids,
-                            'settings': settings,
-                            'is_active': 1
-                        }
-                        self._monitoring_tasks_cache[user_id].append(task)
-                        return True
+                    task = {
+                        'id': task_id,
+                        'label': label,
+                        'chat_ids': chat_ids,
+                        'settings': settings,
+                        'is_active': 1
+                    }
+                    self._monitoring_tasks_cache[user_id].append(task)
+                    
+                    return True
+                except sqlite3.IntegrityError:
                     return False
-                except psycopg.errors.UniqueViolation:
-                    return False
+                    
+            else:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute("""
+                            INSERT INTO monitoring_tasks (user_id, label, chat_ids, settings)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (user_id, label) DO NOTHING
+                            RETURNING id
+                        """, (user_id, label, json.dumps(chat_ids), json.dumps(settings)))
+                        
+                        row = cur.fetchone()
+                        conn.commit()
+                        
+                        if row:
+                            task_id = row["id"]
+                            task = {
+                                'id': task_id,
+                                'label': label,
+                                'chat_ids': chat_ids,
+                                'settings': settings,
+                                'is_active': 1
+                            }
+                            self._monitoring_tasks_cache[user_id].append(task)
+                            return True
+                        return False
+                    except psycopg.errors.UniqueViolation:
+                        return False
                         
         except Exception as e:
             logger.exception("Error in add_monitoring_task for %s: %s", user_id, e)
@@ -828,14 +1024,25 @@ class Database:
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 cur.execute("""
                     UPDATE monitoring_tasks
-                    SET settings = %s, updated_at = CURRENT_TIMESTAMP
-                    WHERE user_id = %s AND label = %s
+                    SET settings = ?, updated_at = datetime('now')
+                    WHERE user_id = ? AND label = ?
                 """, (json.dumps(settings), user_id, label))
                 updated = cur.rowcount > 0
                 conn.commit()
+                
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE monitoring_tasks
+                        SET settings = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = %s AND label = %s
+                    """, (json.dumps(settings), user_id, label))
+                    updated = cur.rowcount > 0
+                    conn.commit()
 
             if updated and user_id in self._monitoring_tasks_cache:
                 for task in self._monitoring_tasks_cache[user_id]:
@@ -852,10 +1059,16 @@ class Database:
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM monitoring_tasks WHERE user_id = %s AND label = %s", (user_id, label))
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("DELETE FROM monitoring_tasks WHERE user_id = ? AND label = ?", (user_id, label))
                 deleted = cur.rowcount > 0
                 conn.commit()
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM monitoring_tasks WHERE user_id = %s AND label = %s", (user_id, label))
+                    deleted = cur.rowcount > 0
+                    conn.commit()
 
             if deleted and user_id in self._monitoring_tasks_cache:
                 self._monitoring_tasks_cache[user_id] = [t for t in self._monitoring_tasks_cache[user_id] if t.get('label') != label]
@@ -873,11 +1086,12 @@ class Database:
             conn = self.get_connection()
             tasks = []
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 cur.execute("""
                     SELECT id, label, chat_ids, settings, is_active 
                     FROM monitoring_tasks 
-                    WHERE user_id = %s AND is_active = TRUE 
+                    WHERE user_id = ? AND is_active = 1 
                     ORDER BY created_at ASC
                 """, (user_id,))
                 
@@ -885,11 +1099,30 @@ class Database:
                     task = {
                         'id': row["id"],
                         'label': row["label"],
-                        'chat_ids': row["chat_ids"] if row["chat_ids"] else [],
-                        'settings': row["settings"] if row["settings"] else {},
+                        'chat_ids': json.loads(row["chat_ids"]) if row["chat_ids"] else [],
+                        'settings': json.loads(row["settings"]) if row["settings"] else {},
                         'is_active': row["is_active"]
                     }
                     tasks.append(task)
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id, label, chat_ids, settings, is_active 
+                        FROM monitoring_tasks 
+                        WHERE user_id = %s AND is_active = TRUE 
+                        ORDER BY created_at ASC
+                    """, (user_id,))
+                    
+                    for row in cur.fetchall():
+                        task = {
+                            'id': row["id"],
+                            'label': row["label"],
+                            'chat_ids': row["chat_ids"] if row["chat_ids"] else [],
+                            'settings': row["settings"] if row["settings"] else {},
+                            'is_active': row["is_active"]
+                        }
+                        tasks.append(task)
 
             if tasks:
                 self._monitoring_tasks_cache[user_id] = tasks
@@ -904,8 +1137,9 @@ class Database:
             conn = self.get_connection()
             tasks = []
             
-            with conn.cursor() as cur:
-                cur.execute("SELECT user_id, id, label, chat_ids, settings FROM monitoring_tasks WHERE is_active = TRUE")
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT user_id, id, label, chat_ids, settings FROM monitoring_tasks WHERE is_active = 1")
                 
                 for row in cur.fetchall():
                     uid = row["user_id"]
@@ -913,8 +1147,8 @@ class Database:
                         'user_id': uid,
                         'id': row["id"],
                         'label': row["label"],
-                        'chat_ids': row["chat_ids"] if row["chat_ids"] else [],
-                        'settings': row["settings"] if row["settings"] else {}
+                        'chat_ids': json.loads(row["chat_ids"]) if row["chat_ids"] else [],
+                        'settings': json.loads(row["settings"]) if row["settings"] else {}
                     }
                     tasks.append(task)
 
@@ -926,6 +1160,30 @@ class Database:
                             'settings': task['settings'],
                             'is_active': 1
                         })
+                        
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id, id, label, chat_ids, settings FROM monitoring_tasks WHERE is_active = TRUE")
+                    
+                    for row in cur.fetchall():
+                        uid = row["user_id"]
+                        task = {
+                            'user_id': uid,
+                            'id': row["id"],
+                            'label': row["label"],
+                            'chat_ids': row["chat_ids"] if row["chat_ids"] else [],
+                            'settings': row["settings"] if row["settings"] else {}
+                        }
+                        tasks.append(task)
+
+                        if uid not in self._monitoring_tasks_cache or not any(t['id'] == task['id'] for t in self._monitoring_tasks_cache.get(uid, [])):
+                            self._monitoring_tasks_cache[uid].append({
+                                'id': task['id'],
+                                'label': task['label'],
+                                'chat_ids': task['chat_ids'],
+                                'settings': task['settings'],
+                                'is_active': 1
+                            })
 
             return tasks
         except Exception as e:
@@ -942,9 +1200,14 @@ class Database:
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM allowed_users WHERE user_id = %s", (user_id,))
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,))
                 exists = cur.fetchone() is not None
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM allowed_users WHERE user_id = %s", (user_id,))
+                    exists = cur.fetchone() is not None
                     
             if exists:
                 self._allowed_users_cache.add(user_id)
@@ -960,13 +1223,23 @@ class Database:
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
-                cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = %s", (user_id,))
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
                 row = cur.fetchone()
                 if row and row["is_admin"]:
                     self._admin_cache.add(user_id)
                     self._allowed_users_cache.add(user_id)
                     return True
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = %s", (user_id,))
+                    row = cur.fetchone()
+                    if row and row["is_admin"]:
+                        self._admin_cache.add(user_id)
+                        self._allowed_users_cache.add(user_id)
+                        return True
                         
             return False
         except Exception:
@@ -978,24 +1251,42 @@ class Database:
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 try:
                     cur.execute("""
                         INSERT INTO allowed_users (user_id, username, is_admin, added_by)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (user_id) DO NOTHING
-                        RETURNING user_id
-                    """, (user_id, username, is_admin, added_by))
+                        VALUES (?, ?, ?, ?)
+                    """, (user_id, username, 1 if is_admin else 0, added_by))
                     conn.commit()
                     
-                    if cur.fetchone() is not None:
-                        self._allowed_users_cache.add(user_id)
-                        if is_admin:
-                            self._admin_cache.add(user_id)
-                        return True
+                    self._allowed_users_cache.add(user_id)
+                    if is_admin:
+                        self._admin_cache.add(user_id)
+                        
+                    return True
+                except sqlite3.IntegrityError:
                     return False
-                except psycopg.errors.UniqueViolation:
-                    return False
+                    
+            else:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute("""
+                            INSERT INTO allowed_users (user_id, username, is_admin, added_by)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (user_id) DO NOTHING
+                            RETURNING user_id
+                        """, (user_id, username, is_admin, added_by))
+                        conn.commit()
+                        
+                        if cur.fetchone() is not None:
+                            self._allowed_users_cache.add(user_id)
+                            if is_admin:
+                                self._admin_cache.add(user_id)
+                            return True
+                        return False
+                    except psycopg.errors.UniqueViolation:
+                        return False
                         
         except Exception as e:
             logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
@@ -1005,10 +1296,16 @@ class Database:
         try:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM allowed_users WHERE user_id = %s", (user_id,))
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
                 removed = cur.rowcount > 0
                 conn.commit()
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM allowed_users WHERE user_id = %s", (user_id,))
+                    removed = cur.rowcount > 0
+                    conn.commit()
 
             if removed:
                 self._allowed_users_cache.discard(user_id)
@@ -1027,7 +1324,8 @@ class Database:
             conn = self.get_connection()
             users = []
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 cur.execute("""
                     SELECT user_id, username, is_admin, added_by, created_at
                     FROM allowed_users
@@ -1038,10 +1336,27 @@ class Database:
                     users.append({
                         'user_id': row["user_id"],
                         'username': row["username"],
-                        'is_admin': row["is_admin"],
+                        'is_admin': bool(row["is_admin"]),
                         'added_by': row["added_by"],
-                        'created_at': row["created_at"].isoformat() if row["created_at"] else None
+                        'created_at': row["created_at"]
                     })
+                    
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT user_id, username, is_admin, added_by, created_at
+                        FROM allowed_users
+                        ORDER BY created_at DESC
+                    """)
+                    
+                    for row in cur.fetchall():
+                        users.append({
+                            'user_id': row["user_id"],
+                            'username': row["username"],
+                            'is_admin': row["is_admin"],
+                            'added_by': row["added_by"],
+                            'created_at': row["created_at"].isoformat() if row["created_at"] else None
+                        })
             
             return users
         except Exception as e:
@@ -1051,21 +1366,43 @@ class Database:
     def get_logged_in_users(self, limit: Optional[int] = None) -> List[Dict]:
         conn = self.get_connection()
         try:
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 if limit and int(limit) > 0:
                     cur.execute(
-                        "SELECT user_id, session_data FROM users WHERE is_logged_in = TRUE ORDER BY updated_at DESC LIMIT %s",
+                        "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC LIMIT ?",
                         (int(limit),),
                     )
                 else:
                     cur.execute(
-                        "SELECT user_id, session_data FROM users WHERE is_logged_in = TRUE ORDER BY updated_at DESC"
+                        "SELECT user_id, session_data FROM users WHERE is_logged_in = 1 ORDER BY updated_at DESC"
                     )
                 rows = cur.fetchall()
                 result = []
                 for r in rows:
-                    result.append({"user_id": r["user_id"], "session_data": r["session_data"]})
+                    try:
+                        user_id = r["user_id"]
+                        session_data = r["session_data"]
+                    except Exception:
+                        user_id, session_data = r[0], r[1]
+                    result.append({"user_id": user_id, "session_data": session_data})
                 return result
+            else:
+                with conn.cursor() as cur:
+                    if limit and int(limit) > 0:
+                        cur.execute(
+                            "SELECT user_id, session_data FROM users WHERE is_logged_in = TRUE ORDER BY updated_at DESC LIMIT %s",
+                            (int(limit),),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT user_id, session_data FROM users WHERE is_logged_in = TRUE ORDER BY updated_at DESC"
+                        )
+                    rows = cur.fetchall()
+                    result = []
+                    for r in rows:
+                        result.append({"user_id": r["user_id"], "session_data": r["session_data"]})
+                    return result
         except Exception as e:
             logger.exception("Error fetching logged-in users: %s", e)
             raise
@@ -1075,7 +1412,8 @@ class Database:
         try:
             sessions = []
             
-            with conn.cursor() as cur:
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
                 cur.execute(
                     """
                     SELECT user_id, session_data, name, phone, is_logged_in 
@@ -1090,8 +1428,26 @@ class Database:
                         "session_data": row["session_data"],
                         "name": row["name"],
                         "phone": row["phone"],
-                        "is_logged_in": row["is_logged_in"]
+                        "is_logged_in": bool(row["is_logged_in"])
                     })
+            else:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT user_id, session_data, name, phone, is_logged_in 
+                        FROM users 
+                        WHERE session_data IS NOT NULL AND session_data != '' 
+                        ORDER BY user_id
+                        """
+                    )
+                    for row in cur.fetchall():
+                        sessions.append({
+                            "user_id": row["user_id"],
+                            "session_data": row["session_data"],
+                            "name": row["name"],
+                            "phone": row["phone"],
+                            "is_logged_in": row["is_logged_in"]
+                        })
             return sessions
             
         except Exception as e:
@@ -1100,8 +1456,10 @@ class Database:
     
     def get_db_status(self) -> Dict:
         status = {
-            "type": "postgresql",
-            "url": self.postgres_url,
+            "type": self.db_type,
+            "path": self.db_path if self.db_type == "sqlite" else self.postgres_url,
+            "exists": False,
+            "size_bytes": None,
             "cache_counts": {
                 "users": len(self._user_cache),
                 "forwarding_tasks": sum(len(tasks) for tasks in self._forwarding_tasks_cache.values()),
@@ -1112,17 +1470,28 @@ class Database:
         }
 
         try:
-            status["connected"] = True
+            if self.db_type == "sqlite":
+                status["exists"] = os.path.exists(self.db_path)
+                if status["exists"]:
+                    status["size_bytes"] = os.path.getsize(self.db_path)
+            else:
+                status["exists"] = True
 
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT table_name 
-                    FROM information_schema.tables 
-                    WHERE table_schema = 'public'
-                """)
-                status["tables"] = [row["table_name"] for row in cur.fetchall()]
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                status["tables"] = [row[0] for row in cur.fetchall()]
+                
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT table_name 
+                        FROM information_schema.tables 
+                        WHERE table_schema = 'public'
+                    """)
+                    status["tables"] = [row["table_name"] for row in cur.fetchall()]
 
         except Exception as e:
             logger.exception("Error getting DB status: %s", e)
@@ -1446,7 +1815,7 @@ def create_message_hash(message_text: str, sender_id: Optional[int] = None) -> s
         content = f"{sender_id}:{message_text.strip().lower()}"
     else:
         content = message_text.strip().lower()
-    return hashlib.md5(content.encode()).hexdig()[:12]
+    return hashlib.md5(content.encode()).hexdigest()[:12]
 
 def is_duplicate_message(user_id: int, chat_id: int, message_hash: str) -> bool:
     key = (user_id, chat_id)
@@ -2220,8 +2589,16 @@ async def handle_db_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await db_call(db.get_db_status)
     
     message_text = "📊 **Database Status**\n\n"
-    message_text += f"**Type:** PostgreSQL\n"
-    message_text += f"**Connected:** {'✅ Yes' if status.get('connected') else '❌ No'}\n"
+    message_text += f"**Type:** {status.get('type', 'Unknown')}\n"
+    
+    if status.get('type') == 'sqlite':
+        message_text += f"**Path:** {status.get('path', 'Unknown')}\n"
+        message_text += f"**Exists:** {'✅ Yes' if status.get('exists') else '❌ No'}\n"
+        if status.get('size_bytes'):
+            size_mb = status['size_bytes'] / (1024 * 1024)
+            message_text += f"**Size:** {size_mb:.2f} MB\n"
+    else:
+        message_text += f"**Connected:** {'✅ Yes' if status.get('exists') else '❌ No'}\n"
     
     message_text += f"\n**Cache Counts:**\n"
     cache_counts = status.get('cache_counts', {})
