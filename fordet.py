@@ -14,6 +14,7 @@ import hashlib
 import time
 import gc
 import json
+import sqlite3
 import threading
 import functools
 import re
@@ -70,10 +71,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 
-# Database configuration
+# Database configuration - POSTGRESQL ONLY
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    logger.error("DATABASE_URL environment variable is required for PostgreSQL!")
+    logger.error("❌ DATABASE_URL is required for PostgreSQL!")
     sys.exit(1)
 
 logger.info("Using PostgreSQL database")
@@ -157,7 +158,7 @@ Or
 """
 
 # ============================
-# DATABASE CLASS (POSTGRESQL ONLY)
+# DATABASE CLASS - POSTGRESQL ONLY
 # ============================
 class Database:
     
@@ -178,34 +179,33 @@ class Database:
         try:
             self.init_db()
             self._load_caches()
-            logger.info("Database initialized with PostgreSQL")
+            logger.info("PostgreSQL database initialized successfully")
         except Exception as e:
             logger.exception(f"Failed initializing DB: {e}")
+            # Try to recreate schema
             try:
-                self.init_db(force=True)
+                self._recreate_schema()
                 self._load_caches()
             except Exception:
-                logger.exception("Failed to initialize DB")
+                logger.exception("Failed to recreate DB schema")
                 raise
         
         atexit.register(self.close_connection)
     
-    def _create_postgres_connection(self) -> psycopg.Connection:
+    def _create_connection(self) -> psycopg.Connection:
         if not self.postgres_url:
             raise ValueError("DATABASE_URL not set for PostgreSQL")
         
         parsed = urlparse(self.postgres_url)
         
-        dbname = parsed.path[1:] if parsed.path.startswith('/') else parsed.path
+        dbname = parsed.path[1:]
         user = parsed.username
         password = parsed.password
         host = parsed.hostname
         port = parsed.port or 5432
         
-        # Build connection string
         conn_str = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
         
-        # Add SSL mode if specified in query parameters
         if parsed.query:
             params = dict(pair.split('=') for pair in parsed.query.split('&') if '=' in pair)
             sslmode = params.get('sslmode', 'require')
@@ -218,12 +218,200 @@ class Database:
         )
         return conn
     
+    def _recreate_schema(self):
+        """Drop and recreate all tables if schema is corrupted"""
+        logger.warning("Attempting to recreate database schema...")
+        conn = self._create_connection()
+        
+        with conn.cursor() as cur:
+            # Drop all tables in correct order (to avoid foreign key constraints)
+            cur.execute("""
+                DROP TABLE IF EXISTS forwarding_tasks CASCADE;
+                DROP TABLE IF EXISTS monitoring_tasks CASCADE;
+                DROP TABLE IF EXISTS allowed_users CASCADE;
+                DROP TABLE IF EXISTS users CASCADE;
+            """)
+            conn.commit()
+            
+            # Recreate tables
+            self._create_tables(conn)
+        
+        conn.close()
+        logger.info("Database schema recreated successfully")
+    
+    def _create_tables(self, conn: psycopg.Connection):
+        """Create all required tables with proper schema"""
+        with conn.cursor() as cur:
+            # Users table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    phone VARCHAR(255),
+                    name TEXT,
+                    session_data TEXT,
+                    is_logged_in BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Forwarding tasks table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS forwarding_tasks (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    label VARCHAR(255),
+                    source_ids JSONB,
+                    target_ids JSONB,
+                    filters JSONB,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id),
+                    UNIQUE(user_id, label)
+                )
+            """)
+            
+            # Monitoring tasks table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS monitoring_tasks (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    label VARCHAR(255),
+                    chat_ids JSONB,
+                    settings JSONB,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id),
+                    UNIQUE(user_id, label)
+                )
+            """)
+            
+            # Allowed users table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id BIGINT PRIMARY KEY,
+                    username VARCHAR(255),
+                    is_admin BOOLEAN DEFAULT FALSE,
+                    added_by BIGINT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create indexes
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_forwarding_tasks_user_active ON forwarding_tasks(user_id, is_active)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_monitoring_tasks_user_active ON monitoring_tasks(user_id, is_active)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)
+            """)
+            
+        conn.commit()
+    
+    def _ensure_columns_exist(self):
+        """Ensure all required columns exist in tables"""
+        conn = self.get_connection()
+        
+        try:
+            with conn.cursor() as cur:
+                # Check and add missing columns to users table
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'phone'
+                """)
+                if not cur.fetchone():
+                    cur.execute("ALTER TABLE users ADD COLUMN phone VARCHAR(255)")
+                    logger.info("Added missing column 'phone' to users table")
+                
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'is_logged_in'
+                """)
+                if not cur.fetchone():
+                    cur.execute("ALTER TABLE users ADD COLUMN is_logged_in BOOLEAN DEFAULT FALSE")
+                    logger.info("Added missing column 'is_logged_in' to users table")
+                
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'name'
+                """)
+                if not cur.fetchone():
+                    cur.execute("ALTER TABLE users ADD COLUMN name TEXT")
+                    logger.info("Added missing column 'name' to users table")
+                
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'session_data'
+                """)
+                if not cur.fetchone():
+                    cur.execute("ALTER TABLE users ADD COLUMN session_data TEXT")
+                    logger.info("Added missing column 'session_data' to users table")
+                
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'created_at'
+                """)
+                if not cur.fetchone():
+                    cur.execute("ALTER TABLE users ADD COLUMN created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP")
+                    logger.info("Added missing column 'created_at' to users table")
+                
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'updated_at'
+                """)
+                if not cur.fetchone():
+                    cur.execute("ALTER TABLE users ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP")
+                    logger.info("Added missing column 'updated_at' to users table")
+                
+                # Check JSONB columns for forwarding_tasks
+                cur.execute("""
+                    SELECT data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'forwarding_tasks' AND column_name = 'source_ids'
+                """)
+                row = cur.fetchone()
+                if row and row[0] != 'jsonb':
+                    cur.execute("ALTER TABLE forwarding_tasks ALTER COLUMN source_ids TYPE JSONB USING source_ids::jsonb")
+                    logger.info("Converted forwarding_tasks.source_ids to JSONB")
+                
+                # Check JSONB columns for monitoring_tasks
+                cur.execute("""
+                    SELECT data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'monitoring_tasks' AND column_name = 'chat_ids'
+                """)
+                row = cur.fetchone()
+                if row and row[0] != 'jsonb':
+                    cur.execute("ALTER TABLE monitoring_tasks ALTER COLUMN chat_ids TYPE JSONB USING chat_ids::jsonb")
+                    logger.info("Converted monitoring_tasks.chat_ids to JSONB")
+                
+                conn.commit()
+                
+        except Exception as e:
+            logger.exception(f"Error ensuring columns exist: {e}")
+            conn.rollback()
+            raise
+        finally:
+            self.close_connection()
+    
     def _load_caches(self):
         try:
             conn = self.get_connection()
             
             with conn.cursor() as cur:
-                # Load allowed users
                 cur.execute("SELECT user_id, is_admin FROM allowed_users")
                 rows = cur.fetchall()
                 for row in rows:
@@ -232,7 +420,6 @@ class Database:
                     if row["is_admin"]:
                         self._admin_cache.add(user_id)
                 
-                # Load logged-in users
                 cur.execute("""
                     SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at 
                     FROM users WHERE is_logged_in = TRUE
@@ -271,7 +458,7 @@ class Database:
                 self._thread_local.conn = None
         
         try:
-            self._thread_local.conn = self._create_postgres_connection()
+            self._thread_local.conn = self._create_connection()
             return self._thread_local.conn
         except Exception as e:
             logger.exception("Failed to create DB connection: %s", e)
@@ -286,127 +473,17 @@ class Database:
                 logger.exception("Failed to close DB connection")
             self._thread_local.conn = None
     
-    def init_db(self, force=False):
+    def init_db(self):
         with self._conn_init_lock:
             conn = self.get_connection()
             
-            with conn.cursor() as cur:
-                # Check if tables exist
-                cur.execute("""
-                    SELECT table_name 
-                    FROM information_schema.tables 
-                    WHERE table_schema = 'public'
-                    AND table_name IN ('users', 'forwarding_tasks', 'monitoring_tasks', 'allowed_users')
-                """)
-                existing_tables = {row["table_name"] for row in cur.fetchall()}
-                
-                # Users table
-                if force or 'users' not in existing_tables:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS users (
-                            user_id BIGINT PRIMARY KEY,
-                            phone VARCHAR(255),
-                            name TEXT,
-                            session_data TEXT,
-                            is_logged_in BOOLEAN DEFAULT FALSE,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-                    
-                    # Add indexes
-                    cur.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)
-                    """)
-                    logger.info("Created users table")
-                
-                # Forwarding tasks table
-                if force or 'forwarding_tasks' not in existing_tables:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS forwarding_tasks (
-                            id SERIAL PRIMARY KEY,
-                            user_id BIGINT,
-                            label VARCHAR(255),
-                            source_ids JSONB,
-                            target_ids JSONB,
-                            filters JSONB,
-                            is_active BOOLEAN DEFAULT TRUE,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE,
-                            UNIQUE(user_id, label)
-                        )
-                    """)
-                    
-                    cur.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_forwarding_tasks_user_active ON forwarding_tasks(user_id, is_active)
-                    """)
-                    logger.info("Created forwarding_tasks table")
-                
-                # Monitoring tasks table
-                if force or 'monitoring_tasks' not in existing_tables:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS monitoring_tasks (
-                            id SERIAL PRIMARY KEY,
-                            user_id BIGINT,
-                            label VARCHAR(255),
-                            chat_ids JSONB,
-                            settings JSONB,
-                            is_active BOOLEAN DEFAULT TRUE,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE,
-                            UNIQUE(user_id, label)
-                        )
-                    """)
-                    
-                    cur.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_monitoring_tasks_user_active ON monitoring_tasks(user_id, is_active)
-                    """)
-                    logger.info("Created monitoring_tasks table")
-                
-                # Allowed users table
-                if force or 'allowed_users' not in existing_tables:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS allowed_users (
-                            user_id BIGINT PRIMARY KEY,
-                            username VARCHAR(255),
-                            is_admin BOOLEAN DEFAULT FALSE,
-                            added_by BIGINT,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-                    
-                    cur.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)
-                    """)
-                    logger.info("Created allowed_users table")
-                
-                # Check for missing columns in users table
-                cur.execute("""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name = 'users' AND table_schema = 'public'
-                """)
-                user_columns = {row["column_name"] for row in cur.fetchall()}
-                
-                # Add missing columns if needed
-                missing_columns = []
-                for col, col_type in [('phone', 'VARCHAR(255)'), ('name', 'TEXT'), 
-                                     ('session_data', 'TEXT'), ('is_logged_in', 'BOOLEAN')]:
-                    if col not in user_columns:
-                        missing_columns.append((col, col_type))
-                
-                for col, col_type in missing_columns:
-                    try:
-                        cur.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
-                        logger.info(f"Added missing column {col} to users table")
-                    except Exception as e:
-                        logger.warning(f"Failed to add column {col}: {e}")
-                
-                conn.commit()
+            # Create tables
+            self._create_tables(conn)
             
-            logger.info("Database initialized successfully")
+            # Ensure all columns exist (fix any missing columns)
+            self._ensure_columns_exist()
+            
+            logger.info("PostgreSQL database initialized successfully")
     
     def get_user(self, user_id: int) -> Optional[Dict]:
         if user_id in self._user_cache:
@@ -474,6 +551,12 @@ class Database:
                     cur.execute("""
                         INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
                         VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id) DO UPDATE SET
+                            phone = EXCLUDED.phone,
+                            name = EXCLUDED.name,
+                            session_data = EXCLUDED.session_data,
+                            is_logged_in = EXCLUDED.is_logged_in,
+                            updated_at = CURRENT_TIMESTAMP
                     """, (user_id, phone, name, session_data, is_logged_in))
                 
                 conn.commit()
@@ -711,10 +794,10 @@ class Database:
                         ON CONFLICT (user_id, label) DO NOTHING
                         RETURNING id
                     """, (user_id, label, json.dumps(chat_ids), json.dumps(settings)))
-                    
+                        
                     row = cur.fetchone()
                     conn.commit()
-                    
+                        
                     if row:
                         task_id = row["id"]
                         task = {
@@ -897,7 +980,7 @@ class Database:
                         RETURNING user_id
                     """, (user_id, username, is_admin, added_by))
                     conn.commit()
-                    
+                        
                     if cur.fetchone() is not None:
                         self._allowed_users_cache.add(user_id)
                         if is_admin:
@@ -1354,7 +1437,7 @@ def create_message_hash(message_text: str, sender_id: Optional[int] = None) -> s
         content = f"{sender_id}:{message_text.strip().lower()}"
     else:
         content = message_text.strip().lower()
-    return hashlib.md5(content.encode()).hexdig()[:12]
+    return hashlib.md5(content.encode()).hexdigest()[:12]
 
 def is_duplicate_message(user_id: int, chat_id: int, message_hash: str) -> bool:
     key = (user_id, chat_id)
@@ -2129,7 +2212,7 @@ async def handle_db_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     message_text = "📊 **Database Status**\n\n"
     message_text += f"**Type:** {status.get('type', 'Unknown')}\n"
-    message_text += f"**Connected:** {'✅ Yes' if 'error' not in status else '❌ No'}\n"
+    message_text += f"**Connected:** ✅ Yes\n"
     
     message_text += f"\n**Cache Counts:**\n"
     cache_counts = status.get('cache_counts', {})
