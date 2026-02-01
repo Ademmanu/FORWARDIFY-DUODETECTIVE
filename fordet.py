@@ -19,7 +19,8 @@ import threading
 import functools
 import re
 import signal
-from datetime import datetime
+import pytz
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Set, Callable, Any, DefaultDict
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
@@ -649,6 +650,62 @@ class Database:
         except Exception as e:
             logger.exception("Error in save_user for %s: %s", user_id, e)
             raise
+    
+    def purge_user_data(self, user_id: int) -> bool:
+        """
+        Completely purge all user data on logout.
+        Returns True if successful.
+        """
+        try:
+            conn = self.get_connection()
+            
+            if self.db_type == "sqlite":
+                cur = conn.cursor()
+                # Delete from forwarding_tasks
+                cur.execute("DELETE FROM forwarding_tasks WHERE user_id = ?", (user_id,))
+                # Delete from monitoring_tasks
+                cur.execute("DELETE FROM monitoring_tasks WHERE user_id = ?", (user_id,))
+                # Clear user session data (set is_logged_in=0, clear session_data)
+                cur.execute("""
+                    UPDATE users 
+                    SET phone = NULL, 
+                        name = NULL, 
+                        session_data = NULL, 
+                        is_logged_in = 0,
+                        updated_at = datetime('now')
+                    WHERE user_id = ?
+                """, (user_id,))
+                conn.commit()
+                
+            else:
+                with conn.cursor() as cur:
+                    # Delete from forwarding_tasks
+                    cur.execute("DELETE FROM forwarding_tasks WHERE user_id = %s", (user_id,))
+                    # Delete from monitoring_tasks
+                    cur.execute("DELETE FROM monitoring_tasks WHERE user_id = %s", (user_id,))
+                    # Clear user session data
+                    cur.execute("""
+                        UPDATE users 
+                        SET phone = NULL, 
+                            name = NULL, 
+                            session_data = NULL, 
+                            is_logged_in = FALSE,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = %s
+                    """, (user_id,))
+                    conn.commit()
+            
+            # Clear all caches for this user
+            self._user_cache.pop(user_id, None)
+            self._forwarding_tasks_cache.pop(user_id, None)
+            self._monitoring_tasks_cache.pop(user_id, None)
+            
+            logger.info(f"Purged all data for user {user_id} on logout")
+            return True
+            
+        except Exception as e:
+            logger.exception(f"Error purging user data for {user_id}: {e}")
+            return False
     
     # ============================
     # FORWARDING TASKS METHODS
@@ -1308,6 +1365,12 @@ class Database:
                     conn.commit()
 
             if removed:
+                # Also purge user data
+                try:
+                    self.purge_user_data(user_id)
+                except Exception:
+                    pass
+                
                 self._allowed_users_cache.discard(user_id)
                 self._admin_cache.discard(user_id)
                 self._user_cache.pop(user_id, None)
@@ -1665,6 +1728,32 @@ async def optimized_gc():
                 pass
         _last_gc_run = current_time
 
+def format_datetime_utc1(dt: datetime = None) -> str:
+    """
+    Format datetime to 'Jan 5, 2025 10:15 AM' in UTC+1 timezone.
+    Cross-platform compatible.
+    """
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    
+    # If datetime is naive (no timezone), assume UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    
+    # Convert to UTC+1
+    utc_plus_one = pytz.timezone('Etc/GMT-1')  # UTC+1
+    dt_utc1 = dt.astimezone(utc_plus_one)
+    
+    # Cross-platform formatting (removes leading zeros from day and hour)
+    month = dt_utc1.strftime('%b')
+    day = str(dt_utc1.day)  # No leading zero
+    year = dt_utc1.strftime('%Y')
+    hour = dt_utc1.strftime('%I').lstrip('0') or '12'  # 12-hour, no leading zero
+    minute = dt_utc1.strftime('%M')
+    am_pm = dt_utc1.strftime('%p')
+    
+    return f"{month} {day}, {year} {hour}:{minute} {am_pm}"
+
 # ============================
 # FORWARDING SYSTEM UTILITIES
 # ============================
@@ -1994,6 +2083,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     
     status_emoji = "🟢" if is_logged_in else "🔴"
     status_text = "Online" if is_logged_in else "Offline"
+    current_time = format_datetime_utc1()
     
     message_text = f"""╔════════════════════════════════════╗
 ║   📨🔍 FORWARDER + DUODETECTIVE BOT   ║
@@ -2005,6 +2095,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
 👤 **User:** {user_name}
 📱 **Phone:** `{user_phone}`
 {status_emoji} **Status:** {status_text}
+🕐 **Time:** {current_time}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -3785,15 +3876,24 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = await db_call(db.get_user, user_id)
-    if user and user.get("is_logged_in"):
-        await message.reply_text(
-            "✅ **You are already logged in!**\n\n"
-            f"📱 Phone: `{user['phone'] or 'Not set'}`\n"
-            f"👤 Name: `{user['name'] or 'User'}`\n\n"
-            "Use /logout if you want to disconnect.",
-            parse_mode="Markdown",
-        )
-        return
+    if user and user.get("is_logged_in") and user.get("session_data"):
+        # Check if session is actually active in memory
+        if user_id in user_clients:
+            await message.reply_text(
+                "✅ **You are already logged in!**\n\n"
+                f"📱 Phone: `{user['phone'] or 'Not set'}`\n"
+                f"👤 Name: `{user['name'] or 'User'}`\n\n"
+                "Use /logout if you want to disconnect.",
+                parse_mode="Markdown",
+            )
+            return
+        else:
+            # Session exists in DB but not in memory - clean it up
+            logger.warning(f"User {user_id} has session in DB but not in memory, cleaning up")
+            try:
+                await db_call(db.purge_user_data, user_id)
+            except Exception:
+                pass
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     
@@ -4137,11 +4237,15 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         finally:
             user_clients.pop(user_id, None)
 
+    # COMPLETELY purge all user data from database
     try:
-        await db_call(db.save_user, user_id, None, None, None, False)
-    except Exception:
-        pass
+        success = await db_call(db.purge_user_data, user_id)
+        if not success:
+            logger.error(f"Failed to purge user data for {user_id}")
+    except Exception as e:
+        logger.exception(f"Error purging user data for {user_id}: {e}")
     
+    # Clear all local caches
     phone_verification_states.pop(user_id, None)
     forwarding_tasks_cache.pop(user_id, None)
     monitoring_tasks_cache.pop(user_id, None)
@@ -4152,9 +4256,12 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
     logout_states.pop(user_id, None)
     reply_states.pop(user_id, None)
     auto_reply_states.pop(user_id, None)
+    
+    # Clear auth cache
+    _auth_cache.pop(user_id, None)
 
     await update.message.reply_text(
-        "👋 **Account disconnected successfully!**\n\n✅ All your forwarding and monitoring tasks have been stopped.\n🔄 Use /login to connect again.",
+        "👋 **Account disconnected successfully!**\n\n✅ All your sessions, tasks, and data have been cleared.\n🔄 Use /login to connect again.",
         parse_mode="Markdown",
     )
     return True
@@ -4549,7 +4656,7 @@ async def notify_user_flood_wait(user_id: int, wait_seconds: int):
         if wait_seconds % 60 > 0:
             wait_minutes += 1  # Round up
         
-        resume_time = datetime.fromtimestamp(time.time() + wait_seconds).strftime('%H:%M:%S')
+        resume_time = format_datetime_utc1(datetime.fromtimestamp(time.time() + wait_seconds, tz=timezone.utc))
         
         message = f"""⏰ **Flood Wait Alert**
 
@@ -4741,10 +4848,11 @@ async def notification_worker(worker_id: int):
                 from telegram import Bot
                 bot_instance = Bot(token=BOT_TOKEN)
             
+            current_time = format_datetime_utc1()
             notification_msg = (
                 f"🚨 **DUPLICATE MESSAGE DETECTED!**\n\n"
                 f"**Task:** {task_label}\n"
-                f"**Time:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"**Time:** {current_time}\n\n"
                 f"📝 **Message Preview:**\n`{preview_text}`\n\n"
                 f"💬 **Reply to this message to respond to the duplicate!**\n"
                 f"(Swipe left on this message and type your reply)"
