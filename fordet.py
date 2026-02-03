@@ -177,35 +177,29 @@ class Database:
         self._allowed_users_cache: Set[int] = set()
         self._admin_cache: Set[int] = set()
         
-        max_retries = 3
-        for attempt in range(max_retries):
+        try:
+            logger.info("Initializing database schema...")
+            self.init_db()
+            logger.info("Database schema initialized successfully")
+            
+            # Load caches - if this fails, we continue with empty caches
             try:
-                logger.info(f"Initializing database (attempt {attempt + 1}/{max_retries})...")
-                self.init_db()
-                logger.info("Database schema initialized successfully")
-                
-                # Small delay to ensure schema is committed
-                time.sleep(1)
-                
-                # Now load caches
                 self._load_caches()
                 logger.info("Database caches loaded successfully")
-                break
-                
             except Exception as e:
-                logger.error(f"Attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    logger.info("Retrying in 2 seconds...")
-                    time.sleep(2)
-                else:
-                    logger.error("All retries failed. The bot may start with empty caches.")
-                    # Initialize empty caches to allow bot to start
-                    self._user_cache = {}
-                    self._forwarding_tasks_cache = defaultdict(list)
-                    self._monitoring_tasks_cache = defaultdict(list)
-                    self._allowed_users_cache = set()
-                    self._admin_cache = set()
-        
+                logger.warning(f"Failed to load caches (continuing with empty caches): {e}")
+                # Initialize empty caches to allow bot to start
+                self._user_cache = {}
+                self._forwarding_tasks_cache = defaultdict(list)
+                self._monitoring_tasks_cache = defaultdict(list)
+                self._allowed_users_cache = set()
+                self._admin_cache = set()
+                
+        except Exception as e:
+            logger.error(f"Failed initializing database schema: {e}")
+            # Re-raise to stop bot if schema initialization fails
+            raise
+            
         atexit.register(self.close_connection)
     
     def _create_postgres_connection(self) -> psycopg.Connection:
