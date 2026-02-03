@@ -200,7 +200,7 @@ class Database:
                 # Re-raise to stop bot if schema initialization fails
                 raise
 			
-			atexit.register(self.close_connection)
+		atexit.register(self.close_connection)
     
     def _create_postgres_connection(self) -> psycopg.Connection:
         if not self.postgres_url:
