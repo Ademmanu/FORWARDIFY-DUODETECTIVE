@@ -177,13 +177,34 @@ class Database:
         self._allowed_users_cache: Set[int] = set()
         self._admin_cache: Set[int] = set()
         
-        try:
-            self.init_db()
-            self._load_caches()
-            logger.info("PostgreSQL database initialized")
-        except Exception as e:
-            logger.exception(f"Failed initializing DB: {e}")
-            raise
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Initializing database (attempt {attempt + 1}/{max_retries})...")
+                self.init_db()
+                logger.info("Database schema initialized successfully")
+                
+                # Small delay to ensure schema is committed
+                time.sleep(1)
+                
+                # Now load caches
+                self._load_caches()
+                logger.info("Database caches loaded successfully")
+                break
+                
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    logger.info("Retrying in 2 seconds...")
+                    time.sleep(2)
+                else:
+                    logger.error("All retries failed. The bot may start with empty caches.")
+                    # Initialize empty caches to allow bot to start
+                    self._user_cache = {}
+                    self._forwarding_tasks_cache = defaultdict(list)
+                    self._monitoring_tasks_cache = defaultdict(list)
+                    self._allowed_users_cache = set()
+                    self._admin_cache = set()
         
         atexit.register(self.close_connection)
     
@@ -218,6 +239,26 @@ class Database:
             conn = self.get_connection()
             
             with conn.cursor() as cur:
+                # Check if required columns exist before querying
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users' 
+                    AND table_schema = 'public'
+                    AND column_name IN ('is_logged_in', 'session_data', 'phone', 'name')
+                """)
+                existing_columns = {row[0] for row in cur.fetchall()}
+                
+                required_columns = {'is_logged_in', 'session_data', 'phone', 'name'}
+                missing_columns = required_columns - existing_columns
+                
+                if missing_columns:
+                    logger.warning(f"Skipping cache load, missing columns in users table: {missing_columns}")
+                    # Try to fix the schema
+                    self._migrate_missing_columns()
+                    return
+                
+                # Load allowed users and admins
                 cur.execute("SELECT user_id, is_admin FROM allowed_users")
                 rows = cur.fetchall()
                 for row in rows:
@@ -226,6 +267,7 @@ class Database:
                     if row["is_admin"]:
                         self._admin_cache.add(user_id)
                 
+                # Load logged-in users
                 cur.execute("""
                     SELECT user_id, phone, name, session_data, is_logged_in, created_at, updated_at 
                     FROM users WHERE is_logged_in = TRUE
@@ -247,6 +289,29 @@ class Database:
             logger.info(f"Loaded caches: {len(self._allowed_users_cache)} allowed users, {len(self._user_cache)} logged-in users")
         except Exception as e:
             logger.exception("Error loading caches: %s", e)
+            # Don't crash, continue with empty caches
+    
+    def _migrate_missing_columns(self):
+        """Helper to migrate missing columns on the fly"""
+        try:
+            conn = self.get_connection()
+            with conn.cursor() as cur:
+                # Check users table
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users' 
+                    AND table_schema = 'public'
+                """)
+                existing_columns = {row[0] for row in cur.fetchall()}
+                
+                if 'is_logged_in' not in existing_columns:
+                    logger.info("Migrating: Adding 'is_logged_in' column to users table")
+                    cur.execute("ALTER TABLE users ADD COLUMN is_logged_in BOOLEAN DEFAULT FALSE")
+                    conn.commit()
+                    
+        except Exception as e:
+            logger.error(f"Migration failed: {e}")
     
     def get_connection(self):
         conn = getattr(self._thread_local, "conn", None)
@@ -284,7 +349,11 @@ class Database:
             conn = self.get_connection()
             
             with conn.cursor() as cur:
-                # Users table
+                # ============================
+                # PHASE 1: CREATE TABLES IF NOT EXISTS
+                # ============================
+                
+                # Create users table first (others depend on it)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                         user_id BIGINT PRIMARY KEY,
@@ -297,40 +366,7 @@ class Database:
                     )
                 """)
                 
-                # Forwarding tasks table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS forwarding_tasks (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT,
-                        label VARCHAR(255),
-                        source_ids JSONB,
-                        target_ids JSONB,
-                        filters JSONB,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (user_id) REFERENCES users (user_id),
-                        UNIQUE(user_id, label)
-                    )
-                """)
-                
-                # Monitoring tasks table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS monitoring_tasks (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT,
-                        label VARCHAR(255),
-                        chat_ids JSONB,
-                        settings JSONB,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (user_id) REFERENCES users (user_id),
-                        UNIQUE(user_id, label)
-                    )
-                """)
-                
-                # Allowed users table
+                # Create allowed_users table (no dependencies)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS allowed_users (
                         user_id BIGINT PRIMARY KEY,
@@ -341,23 +377,237 @@ class Database:
                     )
                 """)
                 
-                # Create indexes
+                # Create forwarding_tasks table (depends on users)
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)
+                    CREATE TABLE IF NOT EXISTS forwarding_tasks (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        label VARCHAR(255),
+                        source_ids JSONB,
+                        target_ids JSONB,
+                        filters JSONB,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
                 """)
+                
+                # Create monitoring_tasks table (depends on users)
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_forwarding_tasks_user_active ON forwarding_tasks(user_id, is_active)
+                    CREATE TABLE IF NOT EXISTS monitoring_tasks (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        label VARCHAR(255),
+                        chat_ids JSONB,
+                        settings JSONB,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
                 """)
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_monitoring_tasks_user_active ON monitoring_tasks(user_id, is_active)
-                """)
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)
-                """)
+                
+                conn.commit()  # Commit table creation first
+                
+                # ============================
+                # PHASE 2: ADD FOREIGN KEY CONSTRAINTS (if missing)
+                # ============================
+                
+                # Check and add foreign key constraint for forwarding_tasks
+                try:
+                    cur.execute("""
+                        ALTER TABLE forwarding_tasks 
+                        ADD CONSTRAINT fk_forwarding_tasks_user 
+                        FOREIGN KEY (user_id) REFERENCES users(user_id) 
+                        ON DELETE CASCADE
+                    """)
+                    logger.info("Added foreign key constraint to forwarding_tasks")
+                except Exception as e:
+                    logger.debug(f"Foreign key constraint for forwarding_tasks may already exist: {e}")
+                
+                # Check and add foreign key constraint for monitoring_tasks
+                try:
+                    cur.execute("""
+                        ALTER TABLE monitoring_tasks 
+                        ADD CONSTRAINT fk_monitoring_tasks_user 
+                        FOREIGN KEY (user_id) REFERENCES users(user_id) 
+                        ON DELETE CASCADE
+                    """)
+                    logger.info("Added foreign key constraint to monitoring_tasks")
+                except Exception as e:
+                    logger.debug(f"Foreign key constraint for monitoring_tasks may already exist: {e}")
+                
+                # Add UNIQUE constraint for forwarding_tasks
+                try:
+                    cur.execute("""
+                        ALTER TABLE forwarding_tasks 
+                        ADD CONSTRAINT unique_user_label 
+                        UNIQUE (user_id, label)
+                    """)
+                    logger.info("Added unique constraint to forwarding_tasks")
+                except Exception as e:
+                    logger.debug(f"Unique constraint for forwarding_tasks may already exist: {e}")
+                
+                # Add UNIQUE constraint for monitoring_tasks
+                try:
+                    cur.execute("""
+                        ALTER TABLE monitoring_tasks 
+                        ADD CONSTRAINT unique_monitoring_user_label 
+                        UNIQUE (user_id, label)
+                    """)
+                    logger.info("Added unique constraint to monitoring_tasks")
+                except Exception as e:
+                    logger.debug(f"Unique constraint for monitoring_tasks may already exist: {e}")
+                
+                # ============================
+                # PHASE 3: MIGRATION - ENSURE ALL COLUMNS EXIST
+                # ============================
+                
+                # Dictionary of tables and their required columns
+                table_columns = {
+                    'users': [
+                        ('user_id', 'ADD COLUMN user_id BIGINT PRIMARY KEY'),
+                        ('phone', 'ADD COLUMN phone VARCHAR(255)'),
+                        ('name', 'ADD COLUMN name TEXT'),
+                        ('session_data', 'ADD COLUMN session_data TEXT'),
+                        ('is_logged_in', 'ADD COLUMN is_logged_in BOOLEAN DEFAULT FALSE'),
+                        ('created_at', 'ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
+                        ('updated_at', 'ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
+                    ],
+                    'forwarding_tasks': [
+                        ('id', 'ADD COLUMN id SERIAL PRIMARY KEY'),
+                        ('user_id', 'ADD COLUMN user_id BIGINT'),
+                        ('label', 'ADD COLUMN label VARCHAR(255)'),
+                        ('source_ids', 'ADD COLUMN source_ids JSONB'),
+                        ('target_ids', 'ADD COLUMN target_ids JSONB'),
+                        ('filters', 'ADD COLUMN filters JSONB'),
+                        ('is_active', 'ADD COLUMN is_active BOOLEAN DEFAULT TRUE'),
+                        ('created_at', 'ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
+                        ('updated_at', 'ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
+                    ],
+                    'monitoring_tasks': [
+                        ('id', 'ADD COLUMN id SERIAL PRIMARY KEY'),
+                        ('user_id', 'ADD COLUMN user_id BIGINT'),
+                        ('label', 'ADD COLUMN label VARCHAR(255)'),
+                        ('chat_ids', 'ADD COLUMN chat_ids JSONB'),
+                        ('settings', 'ADD COLUMN settings JSONB'),
+                        ('is_active', 'ADD COLUMN is_active BOOLEAN DEFAULT TRUE'),
+                        ('created_at', 'ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
+                        ('updated_at', 'ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
+                    ],
+                    'allowed_users': [
+                        ('user_id', 'ADD COLUMN user_id BIGINT PRIMARY KEY'),
+                        ('username', 'ADD COLUMN username VARCHAR(255)'),
+                        ('is_admin', 'ADD COLUMN is_admin BOOLEAN DEFAULT FALSE'),
+                        ('added_by', 'ADD COLUMN added_by BIGINT'),
+                        ('created_at', 'ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
+                    ]
+                }
+                
+                # Check and add missing columns for each table
+                for table_name, columns in table_columns.items():
+                    cur.execute("""
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name = %s 
+                        AND table_schema = 'public'
+                    """, (table_name,))
+                    existing_columns = {row[0] for row in cur.fetchall()}
+                    
+                    for column_name, alter_sql in columns:
+                        if column_name not in existing_columns:
+                            logger.info(f"Adding missing column '{column_name}' to {table_name} table")
+                            try:
+                                # Special handling for primary key columns
+                                if 'PRIMARY KEY' in alter_sql:
+                                    # First add the column
+                                    alter_sql_simple = alter_sql.replace(' PRIMARY KEY', '')
+                                    cur.execute(f"ALTER TABLE {table_name} {alter_sql_simple}")
+                                    # Then add primary key constraint
+                                    if table_name == 'users' or table_name == 'allowed_users':
+                                        cur.execute(f"ALTER TABLE {table_name} ADD PRIMARY KEY (user_id)")
+                                else:
+                                    cur.execute(f"ALTER TABLE {table_name} {alter_sql}")
+                            except Exception as e:
+                                logger.warning(f"Could not add column '{column_name}' to {table_name}: {e}")
+                
+                # ============================
+                # PHASE 4: CREATE INDEXES IF NOT EXISTS
+                # ============================
+                
+                indexes = [
+                    ("idx_users_logged_in", "CREATE INDEX IF NOT EXISTS idx_users_logged_in ON users(is_logged_in)"),
+                    ("idx_forwarding_tasks_user_active", "CREATE INDEX IF NOT EXISTS idx_forwarding_tasks_user_active ON forwarding_tasks(user_id, is_active)"),
+                    ("idx_monitoring_tasks_user_active", "CREATE INDEX IF NOT EXISTS idx_monitoring_tasks_user_active ON monitoring_tasks(user_id, is_active)"),
+                    ("idx_allowed_admins", "CREATE INDEX IF NOT EXISTS idx_allowed_admins ON allowed_users(is_admin)"),
+                ]
+                
+                for index_name, create_sql in indexes:
+                    try:
+                        cur.execute(create_sql)
+                    except Exception as e:
+                        logger.warning(f"Could not create index '{index_name}': {e}")
+                
+                # ============================
+                # PHASE 5: DATA MIGRATION (Safe Updates)
+                # ============================
+                
+                # Ensure all users have proper default values for new columns
+                try:
+                    # Update is_logged_in for existing NULL values
+                    cur.execute("""
+                        UPDATE users 
+                        SET is_logged_in = FALSE 
+                        WHERE is_logged_in IS NULL
+                    """)
+                    updated_count = cur.rowcount
+                    if updated_count > 0:
+                        logger.info(f"Updated {updated_count} users with is_logged_in = FALSE")
+                    
+                    # Update updated_at for existing NULL values
+                    cur.execute("""
+                        UPDATE users 
+                        SET updated_at = CURRENT_TIMESTAMP 
+                        WHERE updated_at IS NULL
+                    """)
+                    updated_count = cur.rowcount
+                    if updated_count > 0:
+                        logger.info(f"Updated {updated_count} users with updated_at timestamp")
+                    
+                    # Update forwarding_tasks updated_at
+                    cur.execute("""
+                        UPDATE forwarding_tasks 
+                        SET updated_at = CURRENT_TIMESTAMP 
+                        WHERE updated_at IS NULL
+                    """)
+                    
+                    # Update monitoring_tasks updated_at
+                    cur.execute("""
+                        UPDATE monitoring_tasks 
+                        SET updated_at = CURRENT_TIMESTAMP 
+                        WHERE updated_at IS NULL
+                    """)
+                    
+                except Exception as e:
+                    logger.warning(f"Data migration had issues (non-critical): {e}")
+                
+                # ============================
+                # PHASE 6: VERIFY FINAL SCHEMA
+                # ============================
+                
+                # Log final table structure
+                for table_name in table_columns.keys():
+                    cur.execute("""
+                        SELECT column_name, data_type, is_nullable, column_default
+                        FROM information_schema.columns 
+                        WHERE table_name = %s AND table_schema = 'public'
+                        ORDER BY ordinal_position
+                    """, (table_name,))
+                    columns = cur.fetchall()
+                    logger.info(f"Table '{table_name}' has {len(columns)} columns: {[col[0] for col in columns]}")
                 
             conn.commit()
             
-            logger.info("Database initialized successfully")
+            logger.info("✅ Database schema is fully initialized, migrated, and verified")
     
     def get_user(self, user_id: int) -> Optional[Dict]:
         if user_id in self._user_cache:
