@@ -15,6 +15,7 @@ import time
 import gc
 import json
 import threading
+import traceback
 import functools
 import re
 import signal
@@ -2131,11 +2132,15 @@ async def handle_db_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status = await db_call(db.get_db_status)
     
-    message_text = "📊 **Database Status**\n\n"
-    message_text += f"**Type:** {status.get('type', 'PostgreSQL')}\n"
-    message_text += f"**Connected:** {'✅ Yes' if status.get('connected') else '❌ No'}\n"
+    # Escape all text to prevent Markdown parsing errors
+    db_type = escape_markdown(status.get('type', 'PostgreSQL'), version=2)
+    connected = '✅ Yes' if status.get('connected') else '❌ No'
     
-    message_text += f"\n**Cache Counts:**\n"
+    message_text = "📊 **Database Status**\n\n"
+    message_text += f"**Type:** {db_type}\n"
+    message_text += f"**Connected:** {connected}\n"
+    
+    message_text += "\n**Cache Counts:**\n"
     cache_counts = status.get('cache_counts', {})
     message_text += f"• Users: {cache_counts.get('users', 0)}\n"
     message_text += f"• Forwarding Tasks: {cache_counts.get('forwarding_tasks', 0)}\n"
@@ -2144,10 +2149,13 @@ async def handle_db_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text += f"• Admins: {cache_counts.get('admins', 0)}\n"
     
     if status.get('tables'):
-        message_text += f"\n**Tables:** {', '.join(status['tables'])}"
+        # Escape table names
+        tables = [escape_markdown(t, version=2) for t in status['tables']]
+        message_text += f"\n**Tables:** {', '.join(tables)}"
     
     if status.get('error'):
-        message_text += f"\n\n⚠️ **Error:** {status['error']}"
+        error_msg = escape_markdown(status['error'], version=2)
+        message_text += f"\n\n⚠️ **Error:** {error_msg}"
     
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="owner_panel")]]
     
@@ -3914,11 +3922,12 @@ async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
 # ============================
 async def update_monitoring_for_user(user_id: int):
     if user_id not in user_clients:
+        logger.warning(f"User {user_id} not in user_clients")
         return
     
     client = user_clients[user_id]
     
-    # Clear existing handlers
+    # IMPORTANT FIX: Clear existing handlers BEFORE registering new ones
     if user_id in monitor_handler_registered:
         for handler in monitor_handler_registered[user_id]:
             try:
@@ -3941,7 +3950,7 @@ async def update_monitoring_for_user(user_id: int):
     for chat_id in monitored_chat_ids:
         await register_monitor_handler_for_chat(user_id, chat_id, client)
     
-    logger.info(f"Updated monitoring for user {user_id}: {len(monitored_chat_ids)} chat(s)")
+    logger.info(f"✅ Updated monitoring for user {user_id}: {len(monitored_chat_ids)} chat(s)")
 
 async def register_monitor_handler_for_chat(user_id: int, chat_id: int, client: TelegramClient):
     
@@ -4012,11 +4021,15 @@ async def register_monitor_handler_for_chat(user_id: int, chat_id: int, client: 
             logger.exception(f"Error in monitor message handler for user {user_id}, chat {chat_id}: {e}")
     
     try:
+        # Remove existing handler for this chat if it exists
+        existing_handlers = monitor_handler_registered.get(user_id, [])
+        # We'll just replace all handlers since we cleared them earlier
+        
         client.add_event_handler(_monitor_chat_handler, events.NewMessage(chats=chat_id))
         client.add_event_handler(_monitor_chat_handler, events.MessageEdited(chats=chat_id))
         
         monitor_handler_registered.setdefault(user_id, []).append(_monitor_chat_handler)
-        logger.info(f"Registered monitor handler for user {user_id}, chat {chat_id}")
+        logger.info(f"✅ Registered monitor handler for user {user_id}, chat {chat_id}")
     except Exception as e:
         logger.exception(f"Failed to register monitor handler for user {user_id}, chat {chat_id}: {e}")
 
@@ -4489,29 +4502,36 @@ async def restore_sessions():
     # Restore from environment
     for user_id, session_string in USER_SESSIONS.items():
         if len(user_clients) >= MAX_CONCURRENT_USERS:
+            logger.warning(f"Max concurrent users reached, skipping user {user_id} from env")
             continue
             
         try:
             await restore_single_session(user_id, session_string, from_env=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to restore session from env for user {user_id}: {e}")
 
     # Restore from database
     try:
         users = await asyncio.to_thread(lambda: db.get_logged_in_users(MAX_CONCURRENT_USERS * 2))
-    except Exception:
+        logger.info(f"Found {len(users)} logged-in users in database")
+    except Exception as e:
+        logger.error(f"Error fetching logged-in users: {e}")
         users = []
 
     # Load forwarding tasks
     try:
         all_forward_active = await db_call(db.get_all_active_forwarding_tasks)
-    except Exception:
+        logger.info(f"Loaded {len(all_forward_active)} active forwarding tasks from database")
+    except Exception as e:
+        logger.error(f"Error loading forwarding tasks: {e}")
         all_forward_active = []
 
     # Load monitoring tasks
     try:
         all_monitor_active = await db_call(db.get_all_active_monitoring_tasks)
-    except Exception:
+        logger.info(f"Loaded {len(all_monitor_active)} active monitoring tasks from database")
+    except Exception as e:
+        logger.error(f"Error loading monitoring tasks: {e}")
         all_monitor_active = []
 
     # Clear and populate caches
@@ -4528,6 +4548,7 @@ async def restore_sessions():
             "is_active": 1,
             "filters": t.get("filters", {})
         })
+        logger.debug(f"Added forwarding task '{t['label']}' for user {uid}")
     
     for t in all_monitor_active:
         uid = t["user_id"]
@@ -4538,6 +4559,7 @@ async def restore_sessions():
             "is_active": 1,
             "settings": t.get("settings", {})
         })
+        logger.debug(f"Added monitoring task '{t['label']}' for user {uid}")
 
     # Restore sessions in batches
     batch_size = 3
@@ -4546,19 +4568,29 @@ async def restore_sessions():
         try:
             user_id = row.get("user_id") if isinstance(row, dict) else row[0]
             session_data = row.get("session_data") if isinstance(row, dict) else row[1]
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error parsing user row: {e}")
             continue
 
         if session_data and user_id not in user_clients:
+            logger.info(f"Queueing session restore for user {user_id}")
             restore_tasks.append(restore_single_session(user_id, session_data, from_env=False))
 
         if len(restore_tasks) >= batch_size:
-            await asyncio.gather(*restore_tasks, return_exceptions=True)
+            results = await asyncio.gather(*restore_tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error in batch restore: {result}")
             restore_tasks = []
             await asyncio.sleep(0.5)
     
     if restore_tasks:
-        await asyncio.gather(*restore_tasks, return_exceptions=True)
+        results = await asyncio.gather(*restore_tasks, return_exceptions=True)
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Error in final batch restore: {result}")
+    
+    logger.info(f"✅ Session restoration complete. Active users: {len(user_clients)}")
 
 async def restore_single_session(user_id: int, session_data: str, from_env: bool = False):
     try:
@@ -4596,6 +4628,24 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
                 _ensure_user_send_semaphore(user_id)
                 _ensure_user_rate_limiter(user_id)
                 
+                # CRITICAL FIX: Clear any existing handlers first
+                if user_id in forward_handler_registered:
+                    handler = forward_handler_registered.get(user_id)
+                    if handler:
+                        try:
+                            client.remove_event_handler(handler)
+                        except Exception:
+                            pass
+                    forward_handler_registered.pop(user_id, None)
+                
+                if user_id in monitor_handler_registered:
+                    for handler in monitor_handler_registered[user_id]:
+                        try:
+                            client.remove_event_handler(handler)
+                        except Exception:
+                            pass
+                    monitor_handler_registered.pop(user_id, None)
+                
                 # Start both systems
                 await start_forwarding_for_user(user_id)
                 await start_monitoring_for_user(user_id)
@@ -4613,14 +4663,36 @@ async def restore_single_session(user_id: int, session_data: str, from_env: bool
                 
                 source = "environment variable" if from_env else "database"
                 logger.info(f"✅ Restored session for user {user_id} from {source}")
+                logger.info(f"   Forwarding tasks: {len(user_forward_tasks)}")
+                logger.info(f"   Monitoring tasks: {len(monitoring_tasks_cache.get(user_id, []))}")
                 
             except Exception as e:
                 logger.exception(f"Error in restore_single_session for user {user_id}: {e}")
+                # Still try to initialize handlers even if other parts fail
                 try:
                     target_entity_cache.setdefault(user_id, OrderedDict())
                     chat_entity_cache.setdefault(user_id, {})
                     _ensure_user_send_semaphore(user_id)
                     _ensure_user_rate_limiter(user_id)
+                    
+                    # Clear existing handlers
+                    if user_id in forward_handler_registered:
+                        handler = forward_handler_registered.get(user_id)
+                        if handler:
+                            try:
+                                client.remove_event_handler(handler)
+                            except Exception:
+                                pass
+                        forward_handler_registered.pop(user_id, None)
+                    
+                    if user_id in monitor_handler_registered:
+                        for handler in monitor_handler_registered[user_id]:
+                            try:
+                                client.remove_event_handler(handler)
+                            except Exception:
+                                pass
+                        monitor_handler_registered.pop(user_id, None)
+                    
                     await start_forwarding_for_user(user_id)
                     await start_monitoring_for_user(user_id)
                 except Exception:
@@ -4954,6 +5026,28 @@ async def handle_all_text_messages(update: Update, context: ContextTypes.DEFAULT
     )
 
 # ============================
+# ERROR HANDLER
+# ============================
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors and send a message to the user if possible."""
+    logger.error(f"Exception while handling an update: {context.error}")
+    
+    # Log the traceback
+    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_string = ''.join(tb_list)
+    logger.error(f"Traceback:\n{tb_string}")
+    
+    # Try to notify the user
+    if update and update.effective_chat:
+        try:
+            await update.effective_chat.send_message(
+                "❌ An error occurred while processing your request. Please try again later.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+# ============================
 # MAIN INITIALIZATION
 # ============================
 async def post_init(application: Application):
@@ -5091,6 +5185,9 @@ def main():
     application.add_handler(CommandHandler("ownersets", ownersets_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_text_messages))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
 
     logger.info("✅ Bot ready!")
     try:
