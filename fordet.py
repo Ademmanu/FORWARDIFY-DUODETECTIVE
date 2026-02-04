@@ -176,6 +176,7 @@ class Database:
         self._monitoring_tasks_cache: Dict[int, List[Dict]] = defaultdict(list)
         self._allowed_users_cache: Set[int] = set()
         self._admin_cache: Set[int] = set()
+        
         try:
             logger.info("Initializing database schema...")
             self.init_db()
